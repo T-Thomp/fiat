@@ -400,6 +400,8 @@ class Calibration(object):
                     cu_kind=e.get("computational_unit"),
                     cu_id=e.get("computational_unit_id"),
                     freq=e.get("freq"),
+                    scale=e.get("scale_factor", 1.0), # defaults to 1.0 to do nothing
+                    offset=e.get("offset_factor", 0.0), # defaults to 0.0 to do nothing
                 )
             )
 
@@ -427,6 +429,9 @@ class Calibration(object):
         arrays_by_type: Dict[str, np.ndarray] = {}
         unit_by_type: Dict[str, str] = {}
 
+        # this is really should be a lambda function, but for legibility
+        # it is broken into multiple lines here.
+        # FIXME: This is not professionally written.
         def _ensure_matrix_for_type(typ: str):
             if typ not in arrays_by_type:
                 arrays_by_type[typ] = np.full((n_cu, n_time), np.nan, dtype=float)
@@ -445,6 +450,8 @@ class Calibration(object):
             cu_id = m["cu_id"]
             name = m["name"]
             freq = m["freq"]
+            scale = m["scale"]
+            offset = m["offset"]
 
             if cu_id not in names_by_id and name is not None:
                 names_by_id[cu_id] = name
@@ -474,6 +481,9 @@ class Calibration(object):
             else:
                 s_aligned_vals = s_aligned.to_numpy()
 
+            # Apply scale and offset
+            s_aligned_vals = s_aligned_vals * scale + offset
+
             row = id_to_first_index[cu_id]
             arrays_by_type[typ][row, :] = s_aligned_vals
 
@@ -491,14 +501,17 @@ class Calibration(object):
         # Build data variables with units in attrs
         data_vars = {}
         for typ, arr in arrays_by_type.items():
-            data_vars[typ] = ((dim_name, "time"), arr, {"units": unit_by_type[typ]})
+            var_attrs = {
+                "units": unit_by_type[typ],
+                "applied_offset_factor": float(offset),
+                "applied_scale_factor": float(scale),
+            }
+            data_vars[typ] = ((dim_name, "time"), arr, var_attrs)
 
         ds = xr.Dataset(data_vars=data_vars, coords=coords)
 
         if cu_kind is not None:
             ds.attrs["computational_unit_kind"] = cu_kind
-
-        # return ds
 
         # Quantify using the SAME registry we configured above
         quantify_map = {typ: unit for typ, unit in unit_by_type.items()}
@@ -561,7 +574,9 @@ class Calibration(object):
         self.calibration.generate_obs_templates(output_path=output_path)
 
         # 3. observation part
-        self.observations.to_netcdf(
+        # extra units of observations to explicitely write it through
+        # the `.encoding` attribute of xarray.Dataset.to_netcdf()
+        self.observations.pint.dequantify().to_netcdf(
             os.path.join(
                 output_path,
                 'observations',
