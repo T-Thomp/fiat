@@ -589,7 +589,8 @@ class Calibration(object):
         self._eval()
 
         # 5. summarize FIAT inputs
-        self._summarize_fiat_inputs(output_path=output_path)
+        if summarize:
+            self._summarize_fiat_inputs(output_path=output_path)
 
         return
 
