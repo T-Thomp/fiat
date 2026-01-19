@@ -546,7 +546,8 @@ class Calibration(object):
 
     def prepare(
         self,
-        output_path: PathLike = None) -> None:
+        output_path: PathLike = None,
+        summarize: bool = True) -> None:
         """Render templates, write observations, and stage evaluation scripts.
 
         Parameters

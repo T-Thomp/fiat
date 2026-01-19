@@ -181,7 +181,7 @@ class MESH(ModelBuilder):
         # assign patterns to search in `run_options_path` file
         fname_pattern = re.compile(r"\bfname\s*=\s*([^ \t#;]+)")
         fpath_pattern = re.compile(r"\bfpath\s*=\s*([^ \t#;]+)")
-        forcinglist_pattern = re.compile(r"^\s*FORCINGFILESLIST\s+([^\s#;]+)")
+        forcinglist_pattern = re.compile(r"^\s*FORCINGLIST\s+([^\s#;]+)")
         patterns_list = [
             ('fname', fname_pattern),
             ('fpath', fpath_pattern),
@@ -266,7 +266,7 @@ class MESH(ModelBuilder):
 
                         # if FORCINGFILESLIST option is provided
                         elif pattern_name == 'FORCINGFILESLIST':
-                            forcing_file_list = m.group(1).rstrip('\r\n')
+                            forcing_file_list = m.group(1).rstrip('\r\n') + '.txt'
                             # read the forcing file list and check if all files exist
                             with open(os.path.join(self.config['instance_path'], forcing_file_list), "r", encoding="utf-8") as f:
                                 for line in f:
