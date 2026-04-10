@@ -168,6 +168,27 @@ class Calibration(object):
         self.model_config = model_config
         self._obs = observations
 
+        # determine involved fluxes (or state variables) for calibration
+        fluxes = []
+        keyword_group = ['helper', 'custom', 'flux', 'state', 'state_variable']
+        if self.calibration_config is not None:
+            for group, group_dict in self.calibration_config.get('objective_functions', {}).items():
+                if any(keyword in group for keyword in keyword_group):
+                    for flux in group_dict.keys():
+                        if flux not in fluxes:
+                            fluxes.append(flux)
+                else:
+                    raise ValueError(
+                        f"Unknown objective function group '{group}' in"
+                         " `calibration_config['objective_functions']`. ")
+
+        # if no fluxes are defined, issue a warning
+        if len(fluxes) == 0:
+            raise ValueError(
+                "No fluxes defined in `calibration_config['objective_functions']`. "
+                "At least one flux or state variable must be specified for calibration."
+            )
+
         # build the model-specific object
         match self.model_software:
             case 'mesh':
@@ -175,7 +196,7 @@ class Calibration(object):
                 self.model = MESH(
                     config=self.model_config,
                     calibration_software=self.calibration_software,
-                    fluxes=self.calibration_config.get('objective_functions').keys(),
+                    fluxes=fluxes,
                     dates=self.calibration_config.get('dates'),
                     spinup=self.calibration_config.get('spinup_start'),
                 )
@@ -423,6 +444,8 @@ class Calibration(object):
         # Coordinate arrays per computational unit
         names_by_id: Dict[int, str] = {}
         freq_by_id: Dict[int, str] = {}
+        scale_by_id: Dict[int, float] = {}
+        offset_by_id: Dict[int, float] = {}
         cu_kind: str | None = None
 
         # Prepare containers per type
@@ -457,6 +480,10 @@ class Calibration(object):
                 names_by_id[cu_id] = name
             if cu_id not in freq_by_id and freq is not None:
                 freq_by_id[cu_id] = freq
+            if cu_id not in scale_by_id:
+                scale_by_id[cu_id] = scale
+            if cu_id not in offset_by_id:
+                offset_by_id[cu_id] = offset
 
             _ensure_matrix_for_type(typ)
 
@@ -490,6 +517,8 @@ class Calibration(object):
         # Build coords
         name_arr = np.array([names_by_id.get(cu, None) for cu in cu_ids], dtype=str)
         freq_arr = np.array([freq_by_id.get(cu, None) for cu in cu_ids], dtype=str)
+        scale_arr = np.array([scale_by_id.get(cu, 1.0) for cu in cu_ids], dtype=float)
+        offset_arr = np.array([offset_by_id.get(cu, 0.0) for cu in cu_ids], dtype=float)
 
         coords = {
             dim_name: cu_ids,
@@ -503,10 +532,19 @@ class Calibration(object):
         for typ, arr in arrays_by_type.items():
             var_attrs = {
                 "units": unit_by_type[typ],
-                "applied_offset_factor": float(offset),
-                "applied_scale_factor": float(scale),
+                "ancillary_variables": "applied_scale_factor applied_offset_factor",
             }
             data_vars[typ] = ((dim_name, "time"), arr, var_attrs)
+
+        # Ancillary variables for per-gauge scale and offset (CF convention)
+        data_vars["applied_scale_factor"] = (
+            (dim_name,), scale_arr,
+            {"long_name": "scale factor applied to raw observations"},
+        )
+        data_vars["applied_offset_factor"] = (
+            (dim_name,), offset_arr,
+            {"long_name": "offset factor applied to raw observations"},
+        )
 
         ds = xr.Dataset(data_vars=data_vars, coords=coords)
 
@@ -625,16 +663,16 @@ class Calibration(object):
             # This path is agnostic to the calibration software being used. These
             # files all must copy for each instance of model evaluation.
             'model_instance_path': './model/',
-            'model_executable': self.model_config.get('executable'),
+            'model_executable': os.path.basename(self.model_config.get('executable')),
             'dates': self.calibration_config.get('dates'),
             'objective_functions': self.calibration_config.get('objective_functions'),
             'results_path': 'results',
             'output_files': [self.model.outputs],
-            'observations_file': os.path.join(
+            'observations_file': os.path.abspath(os.path.join(
                 self.calibration_config.get('instance_path'),
                 'observations',
                 'observations.nc'
-            ),
+            )),
             # based on the calibration_software.templating.py engines, the 
             # `self.model.parameters.keys()` and `self.model.others.keys()`
             # are templated under:
@@ -649,8 +687,9 @@ class Calibration(object):
             # `others` are static in each iteration but necessary to
             # be read by the script---USING `TEMPLATES` PATH
             'others': {
-                key: os.path.join('../templates', f'{key}.json')
-                         for key in self.model.others.keys()}
+                key: os.path.join('../templates', f'{key}.{self.model.others[key]["type"]}')
+                for key in self.model.others.keys()
+            }
         }
 
         # dumping the dictionary into a JSON file for the evaluation script

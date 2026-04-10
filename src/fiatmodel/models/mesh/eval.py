@@ -38,6 +38,7 @@ import os
 import re
 import json
 import shutil
+import sys
 import warnings
 
 from typing import (
@@ -60,9 +61,9 @@ import HydroErr
 
 from pandas.tseries.offsets import DateOffset
 
+# fiat imports
+from fiatmodel.models.valid_ofs import hydro_err_ofs # python list object
 
-# default environment
-my_env = os.environ.copy()
 
 # MESH-specific import
 import meshflow as mf
@@ -82,9 +83,6 @@ _FLOAT_RE = re.compile(
     )$""",
     re.X
 )
-
-# default environment
-my_env = os.environ.copy()
 
 def _parse_numeric_string(s: str) -> Union[int, float, str]:
     """Parse a numeric-like string into a number when possible.
@@ -165,13 +163,27 @@ def _make_object_hook() -> Callable[[Dict[str, Any]], Dict[str, Any]]:
     -------
     callable
         A function suitable for use as ``object_hook`` in :func:`json.loads`
-        that applies :func:`_convert_numeric_strings` to every decoded mapping.
+        that applies :func:`_convert_numeric_strings` to every decoded mapping
+        and converts keys to integers where possible.
     """
 
     def object_hook(d):
+        new_d = {}
         for k, v in d.items():
-            d[k] = _convert_numeric_strings(v)  # reuse earlier function
-        return d
+            # 1. Reuse your existing function to convert values recursively
+            # Note: Since object_hook runs bottom-up, 'v' is already processed 
+            # if it was a nested dict. _convert_numeric_strings handles lists/primitives.
+            converted_val = _convert_numeric_strings(v)
+
+            # 2. Attempt to convert the key to an integer
+            try:
+                converted_key = int(k)
+            except ValueError:
+                converted_key = k
+            
+            new_d[converted_key] = converted_val
+        return new_d
+
     return object_hook
 
 def _reset_dir(path: str) -> None:
@@ -272,7 +284,7 @@ def build_calibration_subset(
     # Extract intervals
     starts = pd.to_datetime([d['start'] for d in dates])
     ends   = pd.to_datetime([d['end'] for d in dates])
-    
+
     if len(starts) != len(ends):
         raise ValueError("Starts and ends length mismatch.")
 
@@ -297,7 +309,12 @@ def build_calibration_subset(
     orig_min, orig_max = time_index.min(), time_index.max()
     requested_min, requested_max = union_index.min(), union_index.max()
     if requested_min < orig_min or requested_max > orig_max:
-        raise KeyError("Requested calibration range beyond simulation time-series")
+        raise KeyError(
+            "Requested calibration range beyond simulation time-series. "
+            f"Dataset time range: [{orig_min}, {orig_max}], "
+            f"requested range: [{requested_min}, {requested_max}], "
+            f"inferred freq: {freq}"
+        )
 
     # Reindex (no fill method => NaNs)
     out = ds.reindex(time=union_index)
@@ -374,6 +391,65 @@ def resample_per_variable(
             raise TypeError(f"Reducer for '{var}' must be a string or callable")
     return xr.Dataset(out)
 
+def build_station_series(sim_sub, obs_sub, flux_var, station_ids):
+    """Build per-station simulation and observation series for a given flux.
+
+    Returns dictionaries keyed by station name with ``pd.Series`` values.
+    """
+    sim_series, obs_series = {}, {}
+    for st in station_ids:
+        name = obs_sub['name'].sel(subbasin=st).to_numpy().tolist()
+        sim_series[name] = sim_sub[flux_var].sel(subbasin=st).to_series()
+        obs_series[name] = obs_sub[flux_var].sel(subbasin=st).to_series()
+    return sim_series, obs_series
+
+def compute_metric_dict(sim_series, obs_series, metric_name):
+    """Compute a HydroErr metric for each station.
+
+    Returns a dictionary keyed by station name with scalar metric values.
+    """
+    metric_func = getattr(HydroErr, metric_name)
+    return {
+        name: metric_func(sim_series[name], obs_series[name])
+        for name in obs_series
+    }
+
+def write_of_csv(output_dir, group, flux_var, metric_name, index, value):
+    """Write a single objective function value to a CSV file."""
+    path = os.path.join(
+        output_dir,
+        f'{group}_{flux_var.upper()}_{metric_name}_{index}.csv',
+    )
+    with open(path, 'w') as f:
+        f.write(f'{value}')
+
+def write_penalty_values(eval_config, penalty=1e10):
+    """Write penalty values for all configured objective functions."""
+    output_dir = os.path.join('./etc', 'eval')
+    for group, group_metrics in eval_config.get('objective_functions').items():
+        if any(kw in group for kw in ['flux', 'custom']):
+            for flux_var in group_metrics:
+                for idx, metric_name in enumerate(group_metrics[flux_var], start=1):
+                    write_of_csv(output_dir, group, flux_var, metric_name, idx, penalty)
+
+def normalize_expressions(value):
+    """Ensure expressions are a list; wrap a bare string into a single-element list."""
+    if isinstance(value, list):
+        return value
+    return [value]
+
+def rewrite_expr(expression, keys, flux_var, dict_name):
+    """Replace metric names in ``expression`` with explicit dict references.
+
+    Each key in ``keys`` is replaced with ``{dict_name}['{flux_var}']['{key}']``.
+    """
+    result = expression
+    for k in keys:
+        pattern = rf'\b{re.escape(k)}\b'
+        replacement = f"{dict_name}['{flux_var}']['{k}']"
+        result = re.sub(pattern, replacement, result)
+    return result
+
 if __name__ == "__main__":
     # read the `json` configuration file
     with open("./etc/eval/eval.json", "r") as f:
@@ -407,8 +483,12 @@ if __name__ == "__main__":
             mesh_inputs[param_name] = json.load(f, object_hook=_make_object_hook())
     # doing the same for the `others` files
     for other_name, file_path in others_file_paths.items():
-        with open(file_path, 'r', encoding='utf-8') as f:
-            mesh_inputs[other_name] = json.load(f, object_hook=_make_object_hook())
+        ext = os.path.splitext(file_path)[-1].lower()
+        if ext == '.json':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                mesh_inputs[other_name] = json.load(f, object_hook=_make_object_hook())
+        else:
+            pass # probably `.nc` or others
 
     # use meshflow to generate the parameter files
     # class
@@ -416,29 +496,66 @@ if __name__ == "__main__":
         class_case=mesh_inputs['case_entry'],
         class_info=mesh_inputs['info_entry'],
         class_grus=mesh_inputs['class']
-    )
+    )   
+
+    # extract hydrology + routing paramaters available for calibration
+    # since `routing` is a list, the first element is chosen with [0]
+    # but since `hydrology` is a dictionary, we choose the first element
+    # differently
+    first_element_hydrology = next(iter(mesh_inputs['hydrology']))
+    kwargs: dict[str | Any] = { 
+        'process_details': {
+            'routing': list(mesh_inputs['routing'][0].keys()),
+            'hydrology': list(mesh_inputs['hydrology'][first_element_hydrology].keys()),
+        },  
+    }
+
+    # read the `MESH_parameters.nc` file as well, if provided
+    if eval_config['others']['parameters_ds']:
+        mesh_parameters_path = os.path.join(root_file_path, eval_config['others']['parameters_ds'])
+        mesh_parameters_ds = xr.open_dataset(mesh_parameters_path)
+
+        # add mesh_parameters_ds to `kwargs` so it can be used in the template rendering
+        kwargs['parameters_ds'] = mesh_parameters_ds
+
     # hydrology
-    hydrology_file = mf.utility.render_hydrology_template(
+    hydrology_file, parameters_ds = mf.utility.render_hydrology_template(
         routing_params=mesh_inputs['routing'],
         hydrology_params=mesh_inputs['hydrology'],
+        hru_dim='subbasin', # hard-coded: FIXME later
+        gru_dim='NGRU', # hard-coded: FIXME later
+        return_ds=True,
+        **kwargs,
     )
+
     # apply changes to the MESH instance
     with open(os.path.join(eval_config['model_instance_path'], "MESH_parameters_CLASS.ini"), "w", encoding="utf-8") as f:
         f.write(class_file)
     with open(os.path.join(eval_config['model_instance_path'], "MESH_parameters_hydrology.ini"), "w", encoding="utf-8") as f:
         f.write(hydrology_file)
+    parameters_ds.to_netcdf(os.path.join(eval_config['model_instance_path'], "MESH_parameters.nc"))
 
     # run the MESH model
+    my_env = os.environ.copy()
     try:
-        # subprocess running model
-        subprocess.run(
-            ['./' + eval_config['model_executable']],
-            cwd=eval_config['model_instance_path'],
-            check=True,
-            env=my_env)
+        with open(os.path.join('model_run.log'), 'w') as f:
+            subprocess.run(
+                ['./' + eval_config['model_executable']],
+                cwd=eval_config['model_instance_path'],
+                check=True,
+                env=my_env,
+                stdout=f,
+                stderr=f)
+    except subprocess.CalledProcessError as e:
+        warnings.warn(
+            f'MODEL EXECUTION FAILED WITH ERROR CODE {e.returncode}. '
+            'OBJECTIVE FUNCTION VALUES WILL BE SET TO A LARGE NUMBER.'
+        )
+        write_penalty_values(eval_config)
+        sys.exit(0)
 
-        # first read the time-series of obs/sim for
-        #      each element in the `obs` file
+    # post-process simulation results and evaluate objective functions
+    try:
         simulations = xr.open_dataset(
             os.path.join(
                 eval_config['model_instance_path'],
@@ -447,8 +564,7 @@ if __name__ == "__main__":
             )
         )
 
-        # as a sanity check, make sure both `subbasin` and `time`
-        # dimensions are available in both datasets
+        # sanity check: both datasets need 'subbasin' and 'time' dimensions
         for dim in ['subbasin', 'time']:
             if dim not in simulations.dims:
                 raise ValueError(
@@ -459,127 +575,166 @@ if __name__ == "__main__":
                     f'Dimension `{dim}` not found in observation data.'
                 )
 
-        # selected calibration dates
-        sim_sub = build_calibration_subset(
-            simulations,
-            eval_config.get('dates')
-        )
-        obs_sub = build_calibration_subset(
-            observations,
-            eval_config.get('dates')
-        )
+        # subset to calibration dates
+        sim_sub = build_calibration_subset(simulations, eval_config.get('dates'))
+        obs_sub = build_calibration_subset(observations, eval_config.get('dates'))
 
-        # based on the observation file, understand the time-step
-        # interval of the observations
+        # resample if observation and simulation time-steps differ
         obs_ts = str(np.unique(obs_sub['freq'].values)[0])
-        # and extract the simulation time-step accordingly
         sim_ts = xr.infer_freq(sim_sub['time'])
-
-        # if the time-steps are different, perform resampling
+        ts_interval = pd.tseries.frequencies.to_offset
         # FIXME: for now, the variables are averaged. As, the script is set to
         #        work with streamflow only (simplifying assumption). This will
         #        be fixed in the future releases.
-        # resampling the time-series matching the observations time-step
-        ts_interval = pd.tseries.frequencies.to_offset
-        # check the variable name in DEFAULTS and see if we should take the
-        # `mean` or `sum` during resampling
-        # Suppose ds has variables QO and QI and a time dimension
-        var = set(sim_sub.variables) - set(DEFAULTS.get('default_variables'))
-
         if ts_interval(obs_ts) != ts_interval(sim_ts):
-            for v in var:
+            resample_vars = set(sim_sub.variables) - set(DEFAULTS.get('default_variables'))
+            for v in resample_vars:
                 how = 'mean' if v in DEFAULTS['output_variables']['mean'] else 'sum'
-                sim_sub = resample_per_variable(sim_sub, rule=obs_ts, methods={"QO": "sum", "QI": "mean"},)
-        else:
-            pass # just use obs_sub as is
+                sim_sub = resample_per_variable(sim_sub, rule=obs_ts, methods={"QO": "sum", "QI": "mean"})
 
-        # extract names for the `observations` - can be hard-coded
-        station_ids = obs_sub.subbasin.to_numpy().tolist()
-        station_names = obs_sub.name.to_numpy().tolist()
+        # Filter out stations whose observations are entirely NaN for
+        # the selected calibration period.  Keeps only stations that have
+        # at least one non-NaN value in any observed data variable.
+        all_station_ids = obs_sub.subbasin.to_numpy().tolist()
+        obs_data_vars = [
+            v for v in obs_sub.data_vars
+            if v not in ('applied_scale_factor', 'applied_offset_factor')
+        ]
+        station_ids = []
+        for st in all_station_ids:
+            st_slice = obs_sub.sel(subbasin=st)
+            all_nan = all(
+                np.isnan(st_slice[v].values).all() for v in obs_data_vars
+            )
+            if all_nan:
+                st_name = obs_sub['name'].sel(subbasin=st).to_numpy().tolist()
+                warnings.warn(
+                    f"Station '{st_name}' (subbasin={st}) has entirely NaN "
+                    f"observations for the calibration period — excluding "
+                    f"from evaluation."
+                )
+            else:
+                station_ids.append(st)
 
-        # evaluate each objective function
+        if len(station_ids) == 0:
+            raise ValueError(
+                "All stations have entirely NaN observations for the "
+                "calibration period. Cannot compute objective functions."
+            )
+
+        station_names = obs_sub.name.sel(subbasin=station_ids).to_numpy().tolist()
+
+        # evaluate objective functions
         of_values = {}
+        helper_ofs = {}
+        custom_ofs = {}
+        output_dir = os.path.join('./etc', 'eval')
 
-        for flux, metrics in eval_config.get('objective_functions').items():
-            sims = {}
-            obs = {}
-            # start populating of_values
-            of_values[flux] = {}
-            # assign simulation results for the selected flux
-            for st in station_ids:
-                # sims dictionary
-                sims[obs_sub['name'].sel(subbasin=st).to_numpy().tolist()] = sim_sub[flux].sel(subbasin=st).to_series()
-                # same for obs dictionary
-                obs[obs_sub['name'].sel(subbasin=st).to_numpy().tolist()] = obs_sub[flux].sel(subbasin=st).to_series()
-            # metric (for example, kge_2012), and ofs (list of individual objective functions
-            for metric, ofs in metrics.items():
-                # add elements to `of_values`
-                of_values[flux][metric] = []
-                # calculate the metric value
-                he_metric = getattr(HydroErr, metric)
-                metric_dict = {}
-                for name in obs.keys():
-                    metric_dict[name] = he_metric(sims[name], obs[name])
+        for group, group_metrics in eval_config.get('objective_functions').items():
 
-                for idx, of in enumerate(ofs, start=1): # a list of objective functions
-                    result = ne.evaluate(of, local_dict=metric_dict)
-                    of_values[flux][metric] = result
+            # helpers: intermediate metrics not written to CSV
+            if 'helper' in group:
+                for flux_var, metrics in group_metrics.items():
+                    helper_ofs[flux_var] = {}
 
-                    # write the of results to a .csv file (with only a single element)
-                    with open(
-                        os.path.join(
-                            './etc',
-                            'eval',
-                            f'{flux.upper()}_{metric}_{idx}.csv',
-                        ),
-                        'w',
-                    ) as f:
-                        f.write(f'{result}')
+                    for metric_name in metrics:
+                        helper_ofs[flux_var][metric_name] = []
 
-    except subprocess.CalledProcessError as e:
-        warnings.warn(
-            f'MODEL EXECUTION FAILED WITH ERROR CODE {e.returncode}. '
-            'OBJECTIVE FUNCTION VALUES WILL BE SET TO A LARGE NUMBER.'
-        )
-        for flux, metrics in eval_config.get('objective_functions').items():
-            for metric, ofs in metrics.items():
-                for idx, of in enumerate(ofs, start=1): # a list of objective functions
-                    # FIXME: Only coding for OSTRICH now, since Ostrich is always
-                    #        dealing with a minimization problem, reporting a large
-                    #        value for failed runs.
-                    result = +1e10
+                        if metric_name in hydro_err_ofs:
+                            # standard HydroErr metric
+                            sim_series, obs_series = build_station_series(
+                                sim_sub, obs_sub, flux_var, station_ids
+                            )
+                            station_metrics = compute_metric_dict(
+                                sim_series, obs_series, metric_name
+                            )
+                            # Warn about stations producing non-finite metrics
+                            nan_stations = [
+                                n for n, v in station_metrics.items()
+                                if not np.isfinite(v)
+                            ]
+                            if nan_stations:
+                                warnings.warn(
+                                    f"Metric '{metric_name}' produced non-finite "
+                                    f"value for station(s) {nan_stations} on flux "
+                                    f"'{flux_var}' — excluding from aggregate "
+                                    f"evaluation."
+                                )
+                            for expr in metrics[metric_name]:
+                                try:
+                                    metric_value = ne.evaluate(expr, local_dict=station_metrics)
+                                except KeyError:
+                                    # Station was excluded (e.g., all-NaN observations)
+                                    continue
+                                if np.isfinite(metric_value):
+                                    helper_ofs[flux_var][metric_name].append(metric_value)
+                        else:
+                            # derived helper: expression referencing previously computed helpers
+                            for k in helper_ofs[flux_var]:
+                                if isinstance(helper_ofs[flux_var][k], list):
+                                    helper_ofs[flux_var][k] = np.array(helper_ofs[flux_var][k])
 
-                    # write the of results to a .csv file (with only a single element)
-                    with open(
-                        os.path.join(
-                            './etc',
-                            'eval',
-                            f'{flux.upper()}_{metric}_{idx}.csv',
-                        ),
-                        'w',
-                    ) as f:
-                        f.write(f'{result}')
+                            existing_keys = [k for k in helper_ofs[flux_var] if k != metric_name]
+                            expressions = normalize_expressions(metrics[metric_name])
+                            for expr in expressions:
+                                rewritten = rewrite_expr(expr, existing_keys, flux_var, 'helper_ofs')
+                                metric_value = eval(rewritten)
+                                helper_ofs[flux_var][metric_name] = metric_value
+
+            # custom: expressions referencing helpers, written to CSV
+            elif 'custom' in group:
+                for flux_var, metrics in group_metrics.items():
+                    custom_ofs[flux_var] = {}
+
+                    for metric_name in metrics:
+                        custom_ofs[flux_var][metric_name] = []
+
+                        helper_keys = list(helper_ofs.get(flux_var, {}).keys())
+                        custom_keys = [k for k in custom_ofs[flux_var] if k != metric_name]
+                        expressions = normalize_expressions(metrics[metric_name])
+
+                        for idx, expr in enumerate(expressions, start=1):
+                            rewritten = rewrite_expr(expr, helper_keys, flux_var, 'helper_ofs')
+                            rewritten = rewrite_expr(rewritten, custom_keys, flux_var, 'custom_ofs')
+                            metric_value = eval(rewritten)
+                            custom_ofs[flux_var][metric_name] = metric_value
+                            write_of_csv(output_dir, group, flux_var, metric_name, idx, metric_value)
+
+            # standard flux-based objective functions using HydroErr
+            else:
+                for flux_var, metrics in group_metrics.items():
+                    of_values[flux_var] = {}
+                    sim_series, obs_series = build_station_series(
+                        sim_sub, obs_sub, flux_var, station_ids
+                    )
+
+                    for metric_name, expressions in metrics.items():
+                        of_values[flux_var][metric_name] = []
+                        station_metrics = compute_metric_dict(
+                            sim_series, obs_series, metric_name
+                        )
+                        nan_stations = [
+                            n for n, v in station_metrics.items()
+                            if not np.isfinite(v)
+                        ]
+                        if nan_stations:
+                            warnings.warn(
+                                f"Metric '{metric_name}' produced non-finite "
+                                f"value for station(s) {nan_stations} on flux "
+                                f"'{flux_var}'."
+                            )
+
+                        for idx, expr in enumerate(expressions, start=1):
+                            try:
+                                metric_value = ne.evaluate(expr, local_dict=station_metrics)
+                            except KeyError:
+                                continue
+                            of_values[flux_var][metric_name] = metric_value
+                            write_of_csv(output_dir, group, flux_var, metric_name, idx, metric_value)
 
     except (ValueError, TypeError, KeyError) as e:
         warnings.warn(
             f'MODEL OUTPUT CORRUPTED: {str(e)}. '
             'OBJECTIVE FUNCTION VALUES WILL BE SET TO A LARGE NUMBER.'
         )
-        for flux, metrics in eval_config.get('objective_functions').items():
-            for metric, ofs in metrics.items():
-                for idx, of in enumerate(ofs, start=1): # a list of objective functions
-                    # FIXME: Only coding for OSTRICH now, since Ostrich is always
-                    #        dealing with a minimization problem, reporting a large
-                    #        value for failed runs.
-                    result = +1e10
-
-                    # write the of results to a .csv file (with only a single element)
-                    with open(
-                        os.path.join(
-                            './etc',
-                            'eval',
-                            f'{flux.upper()}_{metric}_{idx}.csv',
-                        ),
-                        'w',
-                    ) as f:
-                        f.write(f'{result}')
+        write_penalty_values(eval_config)

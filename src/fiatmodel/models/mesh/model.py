@@ -11,6 +11,8 @@ import re
 import os
 import shutil
 import sys
+import warnings
+import copy
 
 from typing import (
     Dict,
@@ -133,9 +135,19 @@ class MESH(ModelBuilder):
             'MESH_parameters_CLASS.ini',
             'MESH_parameters_hydrology.ini',
             ]
+
+        # if `executable` is provided in the config, we can also
+        # add it to the required files
+        if 'executable' in self.config:
+            self.required_files.append(self.config['executable'])
+
         # build MESH-specific required directories
         self.required_dirs = [
             'results',
+        ]
+        # MESH optional files
+        self.optional_files = [
+            'MESH_parameters.nc',
         ]
         # time-stamp string for backups
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -475,8 +487,9 @@ class MESH(ModelBuilder):
             #    3. cropland
             #    4. grassland
             #    5. urban, barren land, or imprevious area
-            section_landcover_type = determine_gru_type(
+            gru_indices = determine_gru_type(
                 line=class_section['veg1'].splitlines()[0],
+                fallback_line=class_section['veg1'].splitlines()[1],
             )
             # based on the number extracted above, we can name the
             # GRU class
@@ -488,16 +501,8 @@ class MESH(ModelBuilder):
                 5: "urban",
             }
 
-            # parse the sections -- hard-coded as there are no
-            # other alternatives
-            veg1_params = parse_class_veg1(
-                veg_section=class_section['veg1'],
-                gru_idx=section_landcover_type,
-            )
-            veg2_params = parse_class_veg2(
-                veg_section=class_section['veg2'],
-                gru_idx=section_landcover_type,
-            )
+            # parse shared (non-veg) sections -- these are the same
+            # regardless of vegetation type
             hyd1_params = parse_class_hyd1(
                 hyd_line=class_section['hyd1'],
             )
@@ -517,35 +522,68 @@ class MESH(ModelBuilder):
                 prog_line=class_section['prog3'],
             )
 
-            # make a list of parameters for easier literal unpacking inside
-            # the gru_entry dictionary
-            param_list = [
-                veg1_params,
-                veg2_params,
-                hyd1_params,
-                hyd2_params,
-                soil_params,
-                prog1_params,
-                prog2_params,
-                prog3_params,
-            ]
+            # shared (non-veg) params collected for reuse
+            shared_params = {}
+            for d in [hyd1_params, hyd2_params, soil_params,
+                      prog1_params, prog2_params, prog3_params]:
+                shared_params.update(d)
 
-            # make sure to make an exception for water-like land covers
-            if 'water' in hyd2_params['mid'].lower():
-                class_type = 'water'
-            elif 'snow' in hyd2_params['mid'].lower():
-                class_type = 'water'
-            elif 'ice' in hyd2_params['mid'].lower():
-                class_type = 'water'
+            # determine water-like override from the MID descriptor
+            is_water = any(
+                kw in hyd2_params['mid'].lower()
+                for kw in ('water', 'snow', 'ice')
+            )
+
+            if len(gru_indices) == 1:
+                # Single vegetation type -- existing behavior
+                gru_idx = gru_indices[0]
+
+                veg1_params = parse_class_veg1(
+                    veg_section=class_section['veg1'],
+                    gru_idx=gru_idx,
+                )
+                veg2_params = parse_class_veg2(
+                    veg_section=class_section['veg2'],
+                    gru_idx=gru_idx,
+                )
+
+                if is_water:
+                    class_type = 'water'
+                else:
+                    class_type = class_name_dict[gru_idx]
+
+                gru_entry[idx] = {'class': class_type}
+                gru_entry[idx].update(veg1_params)
+                gru_entry[idx].update(veg2_params)
+                gru_entry[idx].update(shared_params)
+
             else:
-                class_type = class_name_dict[section_landcover_type]
+                # Mixed vegetation type -- produce a list of dicts,
+                # one per non-zero vegetation component. MESHFlow's
+                # render_class_template expects this format.
+                veg_dicts = []
+                for gru_idx in gru_indices:
+                    veg1_p = parse_class_veg1(
+                        veg_section=class_section['veg1'],
+                        gru_idx=gru_idx,
+                    )
+                    veg2_p = parse_class_veg2(
+                        veg_section=class_section['veg2'],
+                        gru_idx=gru_idx,
+                    )
 
-            # adding class type info
-            gru_entry[idx] = {
-                'class': class_type,
-            }
-            # adding parameters
-            gru_entry[idx].update({k: v for d in param_list for k, v in d.items()})
+                    if is_water:
+                        class_type = 'water'
+                    else:
+                        class_type = class_name_dict[gru_idx]
+
+                    combined = {'class': class_type}
+                    combined.update(veg1_p)
+                    combined.update(veg2_p)
+                    combined.update(shared_params)
+                    veg_dicts.append(combined)
+
+                gru_entry[idx] = veg_dicts
 
         return case_entry, info_entry, gru_entry
 
@@ -563,16 +601,30 @@ class MESH(ModelBuilder):
         )
 
         # first, the routing dictionary
-        routing_df = pd.read_csv(StringIO(sections[2]), comment='#', sep='\s+', index_col=0, skiprows=1, header=None)
-        routing_df.index = routing_df.index.str.lower()
-        # we should return a list of values
-        routing_dict = [v for v in routing_df.to_dict().values()]
+        try:
+            routing_df = pd.read_csv(StringIO(sections[2]), comment='#', sep='\s+', index_col=0, skiprows=1, header=None)
+            routing_df.index = routing_df.index.str.lower()
+
+            # we should return a list of values
+            routing_dict = [v for v in routing_df.to_dict().values()]
+
+        except pd.errors.EmptyDataError:
+            warnings.warn(f"The routing section in MESH_parameters_hydrology.ini"
+                          " is empty. Reading `MESH_parameters.nc` file.")
+            routing_ds = xr.open_dataset(os.path.join(self.config['instance_path'], 'MESH_parameters.nc'))
+            routing_df = routing_ds[['flz', 'pwr']].to_dataframe().T.to_dict()
+
+            routing_dict = [v for v in routing_df.values()]
 
         # and second, the hydrology dictionary
         hydrology_df = pd.read_csv(StringIO(sections[4]), comment='#', sep='\s+', index_col=0, skiprows=2, header=None)
         hydrology_df.index = hydrology_df.index.str.lower()
         # and we return a dictionary of this
         hydrology_dict = hydrology_df.to_dict()
+
+        # if the `MESH_parameters.nc` file exists, we can also
+        # read the hydrology parameters from there
+
 
         return routing_dict, hydrology_dict
 
@@ -613,8 +665,19 @@ class MESH(ModelBuilder):
         }
 
         self.others = {
-            'case_entry': case_entry,
-            'info_entry': info_entry,
+            'case_entry': {
+                'type': 'json',
+                'data': case_entry,
+            },
+            'info_entry': {
+                'type': 'json',
+                'data': info_entry,
+            },
+            'parameters_ds': {
+                'type': 'nc',
+                'data': parse_parameters_nc(
+                    os.path.join(self.config['instance_path'], 'MESH_parameters.nc')),
+            },
         }
 
         # add the step logger entry
@@ -732,12 +795,24 @@ class MESH(ModelBuilder):
         # given the parameter bounds in self.config['parameter_bounds'],
         # the necessary parameter dictionaries are templated and saved
 
+        # --- normalize list-of-dicts bounds for mixed-veg GRUs ----------
+        # Users may supply a list of dicts (each with a 'class' key) for
+        # mixed-veg GRUs.  Normalize them into a single dict where veg
+        # params map to {class_name: [min, max]} and GRU-level params map
+        # to [min, max] (widest range across all dicts).
+        normalized_bounds = copy.deepcopy(self.config['parameter_bounds'])
+        if 'class' in normalized_bounds:
+            for unit, unit_bounds in normalized_bounds['class'].items():
+                if isinstance(unit_bounds, list):
+                    normalized_bounds['class'][unit] = \
+                        normalize_mixed_veg_bounds(unit_bounds)
+
         # initialize the `templated_parameters` dictionary
         self.templated_parameters = self.parameters.copy()
 
         # define parameter names that will be involved
         # in the calibration process
-        for group_name, group in self.config['parameter_bounds'].items():
+        for group_name, group in normalized_bounds.items():
             # building the templated_parameters dictionary
             # for each parameter group in the `parameters` dictionary
             for unit in group.keys():
@@ -745,12 +820,32 @@ class MESH(ModelBuilder):
                 # update the values of parameters in each unit
                 unit_params = group[unit]
                 # input can be either a dictionary or a list
-                for p in unit_params.keys():
+                for p, bounds in unit_params.items():
                     if isinstance(self.parameters[group_name], dict):
-                        # iterate over the parameters in the unit
-                        if p in self.parameters[group_name][unit].keys():
-                            # updating the target group dictionary
-                            self.templated_parameters[group_name][unit][p] = param_name_gen(unit, p)
+                        unit_data = self.parameters[group_name][unit]
+
+                        if isinstance(unit_data, list):
+                            # Mixed-veg GRU: unit_data is a list of veg dicts
+                            if isinstance(bounds, dict):
+                                # Veg-specific param: bounds is {class_name: [min, max]}
+                                for i, veg_dict in enumerate(unit_data):
+                                    class_type = veg_dict['class']
+                                    if class_type in bounds and p in veg_dict:
+                                        self.templated_parameters[group_name][unit][i][p] = \
+                                            param_name_gen(unit, f"{p}_{class_type}")
+                            else:
+                                # GRU-level param: bounds is [min, max]
+                                # Template in the first veg dict that contains it
+                                for i, veg_dict in enumerate(unit_data):
+                                    if p in veg_dict:
+                                        self.templated_parameters[group_name][unit][i][p] = \
+                                            param_name_gen(unit, p)
+                                        break
+
+                        elif isinstance(unit_data, dict):
+                            # Single-veg GRU: existing behavior
+                            if p in unit_data:
+                                self.templated_parameters[group_name][unit][p] = param_name_gen(unit, p)
 
                     elif isinstance(self.parameters[group_name], list):
                         if p in self.parameters[group_name][unit - 1].keys():
@@ -762,7 +857,7 @@ class MESH(ModelBuilder):
                             "The parameter bounds for each computational unit "
                             "must be provided as a dictionary or a list."
                         )
-        # define parameter bounds
-        self.parameter_bounds = self.config['parameter_bounds']
+        # define parameter bounds (normalized form)
+        self.parameter_bounds = normalized_bounds
 
         return

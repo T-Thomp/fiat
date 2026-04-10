@@ -17,6 +17,8 @@ import re
 import os
 import sys
 
+import xarray as xr
+
 # NameType type alias for parameter names
 NameType = Union[str, int, float]
 
@@ -27,6 +29,57 @@ if sys.version_info >= (3, 10):
     PathLike: TypeAlias = Union[str, Path]
 else:
     PathLike = Union[str, Path]
+
+# Vegetation-specific CLASS parameters (per-column in the CLASS file).
+# All other CLASS parameters are GRU-level (shared across vegetation types).
+_CLASS_VEG_PARAMS = frozenset([
+    'fcan', 'lamx', 'lnz0', 'lamn', 'alvc', 'cmas', 'alic', 'root',
+    'rsmn', 'qa50', 'vpda', 'vpdb', 'psga', 'psgb',
+])
+
+
+def normalize_mixed_veg_bounds(bounds_list):
+    """Normalize a list-of-dicts parameter bounds for a mixed-veg GRU.
+
+    Each dict in *bounds_list* must contain a ``'class'`` key identifying the
+    vegetation type.  Vegetation-specific parameters get per-class bounds::
+
+        {"fcan": {"needleleaf": [0.1, 0.8], "broadleaf": [0.2, 0.9]}}
+
+    GRU-level parameters are merged to the widest range across all dicts::
+
+        {"sdep": [0.5, 4.0]}
+
+    Parameters
+    ----------
+    bounds_list : list[dict]
+        Each element is ``{'class': '<name>', '<param>': [min, max], ...}``.
+
+    Returns
+    -------
+    dict
+        Normalized bounds mapping consumed by ``MESH.prepare()``.
+    """
+    normalized = {}
+
+    for bounds_dict in bounds_list:
+        class_name = bounds_dict['class']
+        for param, bnd in bounds_dict.items():
+            if param == 'class':
+                continue
+            if param in _CLASS_VEG_PARAMS:
+                # veg-specific: store per-class
+                normalized.setdefault(param, {})[class_name] = bnd
+            else:
+                # GRU-level: widen to the union of all provided ranges
+                if param not in normalized:
+                    normalized[param] = list(bnd)
+                else:
+                    normalized[param][0] = min(normalized[param][0], bnd[0])
+                    normalized[param][1] = max(normalized[param][1], bnd[1])
+
+    return normalized
+
 
 def remove_comments(
     string
@@ -146,54 +199,64 @@ def parse_class_meta_data(
     return info_entry, case_entry
 
 def determine_gru_type(
-    line : str
-) -> int:
-    """Determine GRU type index from a CLASS vegetation header line.
+    line : str,
+    fallback_line : str = None,
+) -> List[int]:
+    """Determine GRU type index(es) from a CLASS vegetation header line.
 
     Parameters
     ----------
     line : str
-        Whitespace-separated line containing GRU fractions and descriptors.
+        Whitespace-separated line containing GRU fractions and descriptors
+        (typically the FCAN line).
+    fallback_line : str, optional
+        A second line (e.g. LNZ0) to inspect when *line* has all-zero
+        values in the first 5 cells.
 
     Returns
     -------
-    int or None
-        1-based index of the first column with value ``1.000`` (or first
-        positive when fractions sum to 1); may be ``None`` if not found.
+    list[int]
+        List of 1-based column indices with non-zero values. For
+        single-vegetation GRUs this is a single-element list (e.g. ``[1]``);
+        for mixed-vegetation GRUs it contains all non-zero indices
+        (e.g. ``[1, 2, 4]``).
 
     Raises
     ------
     ValueError
-        If the line does not represent a valid CLASS GRU type (sum is 0).
+        If neither *line* nor *fallback_line* contain a non-zero value
+        in the first 5 cells.
     """
     tokens = line.strip().split()
     slice_len = min(5, len(tokens))
-    
-    # to track mixed GRU types and also 
-    gru_type_sum = 0
-    
-    # iterate over the first line of the vegetation parameter section
+
+    # collect all non-zero FCAN column indices (1-based)
+    non_zero_indices = []
+    gru_type_sum = 0.0
+
     for i in range(slice_len):
-        # if a distinct GRU, look for 1.000 value
-        if tokens[i] == "1.000":
-            return i + 1  # 1-based
+        val = float(tokens[i])
+        gru_type_sum += val
+        if val > 0:
+            non_zero_indices.append(i + 1)  # 1-based
 
-        # Calculate the sum until this for loop breaks
-        # or ends
-        gru_type_sum += float(tokens[i])
+    if gru_type_sum > 0:
+        return non_zero_indices
 
-    # FIXME: if sum equals to 1, then that means we deal with a mixed GRU
-    #        type, and we will have to add the relevant feature to both
-    #        MESHFlow and MESHFIAT;
-    #        For now, find the first column without non-zero value
-    if gru_type_sum == 1:
-        for i in range(slice_len):
-            if float(tokens[i]) > 0:
-                return i + 1
+    # FCAN is all zeros — fall back to the second line if provided
+    if fallback_line is not None:
+        fb_tokens = fallback_line.strip().split()
+        fb_slice_len = min(5, len(fb_tokens))
 
-    # Raise an error if it is not a valid CLASS field
-    if gru_type_sum == 0:
-        raise ValueError("Invalid CLASS GRU type")
+        fb_indices = []
+        for i in range(fb_slice_len):
+            if float(fb_tokens[i]) != 0:
+                fb_indices.append(i + 1)  # 1-based
+
+        if fb_indices:
+            return fb_indices
+
+    raise ValueError("Invalid CLASS GRU type")
 
 def parse_class_veg1(
     veg_section : str,
@@ -635,6 +698,31 @@ def param_name_gen(
     param_name = '_' + _unit.upper() + _name.upper()
     
     return param_name
+
+def parse_parameters_nc(
+    nc_file: os.PathLike | str,
+) -> Dict[str, float]:
+    """Parse a netCDF file containing MESH parameters, namely
+    `MESH_parameters.nc`.
+
+    Parameters
+    ----------
+    nc_file : path-like
+        File path to the netCDF file with MESH parameters.
+
+    Returns
+    -------
+    params_ds : xarray.Dataset
+        Dataset containing basic parameter values keyed by variable names.
+    """
+    ds = xr.open_dataset(nc_file)
+
+    # drop all variables expect for the following, if available
+    expected_vars = ['lat', 'lon', 'crs', 'subbaisn', 'NGRU', 'nsol', 'nvf', 'ncan']
+
+    params_ds = ds[[var for var in expected_vars if var in ds]]
+
+    return params_ds
 
 def replace_prefix_in_last_two_lines(
     path: PathLike,
