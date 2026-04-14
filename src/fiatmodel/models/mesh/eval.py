@@ -39,6 +39,7 @@ import re
 import json
 import shutil
 import sys
+import textwrap
 import warnings
 
 from typing import (
@@ -404,11 +405,33 @@ def build_station_series(sim_sub, obs_sub, flux_var, station_ids):
     return sim_series, obs_series
 
 def compute_metric_dict(sim_series, obs_series, metric_name):
-    """Compute a HydroErr metric for each station.
+    """Compute a metric for each station.
+
+    ``metric_name`` can be a string (looked up from *HydroErr*) or a
+    callable that accepts ``(simulated, observed)`` and returns a scalar.
 
     Returns a dictionary keyed by station name with scalar metric values.
+
+    .. important::
+
+       **NOTE**: When providing a custom callable, the **first** argument
+       must be the **simulated** time-series and the **second** argument
+       must be the **observed** time-series. For example::
+
+           def my_metric(simulated, observed):
+               return some_scalar
+
     """
-    metric_func = getattr(HydroErr, metric_name)
+    if callable(metric_name):
+        metric_func = metric_name
+    elif hasattr(HydroErr, metric_name):
+        metric_func = getattr(HydroErr, metric_name)
+    else:
+        raise ValueError(
+            f"Metric '{metric_name}' is not a recognized HydroErr "
+            f"metric and is not a callable. Provide a valid HydroErr "
+            f"metric name or a callable accepting (simulated, observed)."
+        )
     return {
         name: metric_func(sim_series[name], obs_series[name])
         for name in obs_series
@@ -454,6 +477,22 @@ if __name__ == "__main__":
     # read the `json` configuration file
     with open("./etc/eval/eval.json", "r") as f:
         eval_config = json.load(f, object_hook=_make_object_hook())
+
+    # Reconstruct user-defined callable metrics from stored source code.
+    _user_metric_funcs = {}
+    for name, source in eval_config.pop('user_defined_metrics', {}).items():
+        _ns = {'np': np, 'numpy': np}
+        exec(textwrap.dedent(source), _ns)
+        _user_metric_funcs[name] = _ns[name]
+
+    # Replace string keys with the reconstructed callables in objective_functions.
+    if _user_metric_funcs:
+        for group in eval_config['objective_functions']:
+            for flux_var in eval_config['objective_functions'][group]:
+                metrics = eval_config['objective_functions'][group][flux_var]
+                for name, func in _user_metric_funcs.items():
+                    if name in metrics:
+                        metrics[func] = metrics.pop(name)
 
     # empty the output directory before anything else
     _reset_dir(
@@ -638,10 +677,11 @@ if __name__ == "__main__":
                     helper_ofs[flux_var] = {}
 
                     for metric_name in metrics:
-                        helper_ofs[flux_var][metric_name] = []
+                        metric_key = metric_name.__name__ if callable(metric_name) else metric_name
+                        helper_ofs[flux_var][metric_key] = []
 
-                        if metric_name in hydro_err_ofs:
-                            # standard HydroErr metric
+                        if metric_name in hydro_err_ofs or callable(metric_name):
+                            # standard HydroErr metric or user-defined callable
                             sim_series, obs_series = build_station_series(
                                 sim_sub, obs_sub, flux_var, station_ids
                             )
@@ -655,7 +695,7 @@ if __name__ == "__main__":
                             ]
                             if nan_stations:
                                 warnings.warn(
-                                    f"Metric '{metric_name}' produced non-finite "
+                                    f"Metric '{metric_key}' produced non-finite "
                                     f"value for station(s) {nan_stations} on flux "
                                     f"'{flux_var}' — excluding from aggregate "
                                     f"evaluation."
@@ -667,19 +707,19 @@ if __name__ == "__main__":
                                     # Station was excluded (e.g., all-NaN observations)
                                     continue
                                 if np.isfinite(metric_value):
-                                    helper_ofs[flux_var][metric_name].append(metric_value)
+                                    helper_ofs[flux_var][metric_key].append(metric_value)
                         else:
                             # derived helper: expression referencing previously computed helpers
                             for k in helper_ofs[flux_var]:
                                 if isinstance(helper_ofs[flux_var][k], list):
                                     helper_ofs[flux_var][k] = np.array(helper_ofs[flux_var][k])
 
-                            existing_keys = [k for k in helper_ofs[flux_var] if k != metric_name]
+                            existing_keys = [k for k in helper_ofs[flux_var] if k != metric_key]
                             expressions = normalize_expressions(metrics[metric_name])
                             for expr in expressions:
                                 rewritten = rewrite_expr(expr, existing_keys, flux_var, 'helper_ofs')
                                 metric_value = eval(rewritten)
-                                helper_ofs[flux_var][metric_name] = metric_value
+                                helper_ofs[flux_var][metric_key] = metric_value
 
             # custom: expressions referencing helpers, written to CSV
             elif 'custom' in group:
@@ -709,7 +749,8 @@ if __name__ == "__main__":
                     )
 
                     for metric_name, expressions in metrics.items():
-                        of_values[flux_var][metric_name] = []
+                        metric_key = metric_name.__name__ if callable(metric_name) else metric_name
+                        of_values[flux_var][metric_key] = []
                         station_metrics = compute_metric_dict(
                             sim_series, obs_series, metric_name
                         )
@@ -719,7 +760,7 @@ if __name__ == "__main__":
                         ]
                         if nan_stations:
                             warnings.warn(
-                                f"Metric '{metric_name}' produced non-finite "
+                                f"Metric '{metric_key}' produced non-finite "
                                 f"value for station(s) {nan_stations} on flux "
                                 f"'{flux_var}'."
                             )
@@ -729,8 +770,8 @@ if __name__ == "__main__":
                                 metric_value = ne.evaluate(expr, local_dict=station_metrics)
                             except KeyError:
                                 continue
-                            of_values[flux_var][metric_name] = metric_value
-                            write_of_csv(output_dir, group, flux_var, metric_name, idx, metric_value)
+                            of_values[flux_var][metric_key] = metric_value
+                            write_of_csv(output_dir, group, flux_var, metric_key, idx, metric_value)
 
     except (ValueError, TypeError, KeyError) as e:
         warnings.warn(
