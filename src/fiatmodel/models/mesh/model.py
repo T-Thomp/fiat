@@ -43,6 +43,13 @@ else:
 # NameType type alias for parameter names
 NameType = Union[str, int, float]
 
+# useful functions for string formatting
+def _rename_proxy(name: str) -> str:
+    return name.replace('LAMN', 'LMN').replace('LAMX', 'LMX') + '_'
+
+def _rename_eff(name: str) -> str:
+    return name.replace('LAMX', 'LAMX_EFF')
+
 class MESH(ModelBuilder):
     """Builder for the MESH calibration instantiation.
 
@@ -410,240 +417,6 @@ class MESH(ModelBuilder):
         # if we reach here, all checks passed, so return True
         return True
 
-    def _copy_minimum_files(self, dest_path: str) -> None:
-        """Copy the minimum required files to a destination path.
-
-        Parameters
-        ----------
-        dest_path : str
-            Destination directory where required files are copied.
-
-        Raises
-        ------
-        FileNotFoundError
-            If any required file is missing in the source instance path.
-        """
-        for file in self.required_files:
-            src_file = os.path.join(self.config['instance_path'], file)
-            dest_file = os.path.join(dest_path, file)
-            if os.path.isfile(src_file):
-                shutil.copy2(src_file, dest_file)
-            else:
-                raise FileNotFoundError(
-                    f"The required file {file} is not found in the instance path "
-                    f"{self.config['instance_path']}."
-                )
-        return
-
-    def _analyze_mesh_class(self) -> Dict:
-        """Analyze CLASS file and construct parameter structures.
-
-        Parses ``MESH_parameters_CLASS.ini`` into multiple sections and builds
-        structures required for templating.
-
-        Notes
-        -----
-        Future releases may also use ``MESH_parameters.txt`` and
-        ``MESH_parameters.nc``.
-
-        Returns
-        -------
-        tuple
-            ``(case_entry, info_entry, gru_entry)`` where entries are dicts
-            keyed per MESH/CLASS semantics.
-        """
-        # two necessary paths for the analysis
-        class_file = os.path.join(
-            self.config['instance_path'], 'MESH_parameters_CLASS.ini'
-        )
-
-        # read the MESH/CLASS file
-        text = Path(class_file).read_text(encoding="utf-8")
-
-        # Split where there is at least one completely blank
-        # line (possibly with spaces)
-        sections = re.split(r'\r?\n\s*\r?\n', text.strip())
-
-        # first section is typically the information section
-        # the middle sections are CLASS computational unit blocks, each
-        #     containing vegetation, soil, hydrology, and prognostic parameters
-        # the last section are the dates that should not be processed and 
-        #     its content does not matter for the analysis
-
-        # building dictionaries out of the first section needed for 
-        # MESHFLOW's `meshflow.utility.render_class_template` function
-        info_entry, case_entry = \
-            parse_class_meta_data(sections[0])
-
-        # create an empty gru_entry dictionary to be further
-        # populated by the following iterative loop
-        gru_entry = {}
-
-        # iterating over the sections until the last one
-        for idx, section in enumerate(sections[1:-1], start=1):
-            # divide the section into a dictionary of sections
-            class_section = class_section_divide(section=section)
-
-            # determine GRU type, based on CLASS assumptions:
-            #    1. needleleaf forest
-            #    2. broadleaf forest
-            #    3. cropland
-            #    4. grassland
-            #    5. urban, barren land, or imprevious area
-            gru_indices = determine_gru_type(
-                line=class_section['veg1'].splitlines()[0],
-                fallback_line=class_section['veg1'].splitlines()[1],
-            )
-            # based on the number extracted above, we can name the
-            # GRU class
-            class_name_dict = {
-                1: "needleleaf",
-                2: "broadleaf",
-                3: "crop",
-                4: "grassland",
-                5: "urban",
-            }
-
-            # parse shared (non-veg) sections -- these are the same
-            # regardless of vegetation type
-            hyd1_params = parse_class_hyd1(
-                hyd_line=class_section['hyd1'],
-            )
-            hyd2_params = parse_class_hyd2(
-                hyd_line=class_section['hyd2'],
-            )
-            soil_params = parse_class_soil(
-                soil_section=class_section['soil'],
-            )
-            prog1_params = parse_class_prog1(
-                prog_line=class_section['prog1'],
-            )
-            prog2_params = parse_class_prog2(
-                prog_line=class_section['prog2'],
-            )
-            prog3_params = parse_class_prog3(
-                prog_line=class_section['prog3'],
-            )
-
-            # shared (non-veg) params collected for reuse
-            shared_params = {}
-            for d in [hyd1_params, hyd2_params, soil_params,
-                      prog1_params, prog2_params, prog3_params]:
-                shared_params.update(d)
-
-            # determine water-like override from the MID descriptor
-            is_water = any(
-                kw in hyd2_params['mid'].lower()
-                for kw in ('water', 'snow', 'ice')
-            )
-
-            if len(gru_indices) == 1:
-                # Single vegetation type -- existing behavior
-                gru_idx = gru_indices[0]
-
-                veg1_params = parse_class_veg1(
-                    veg_section=class_section['veg1'],
-                    gru_idx=gru_idx,
-                )
-                veg2_params = parse_class_veg2(
-                    veg_section=class_section['veg2'],
-                    gru_idx=gru_idx,
-                )
-
-                if is_water:
-                    class_type = 'water'
-                else:
-                    class_type = class_name_dict[gru_idx]
-
-                mid_id = hyd2_params['mid_id']
-                gru_entry[mid_id] = {'class': class_type}
-                gru_entry[mid_id].update(veg1_params)
-                gru_entry[mid_id].update(veg2_params)
-                gru_entry[mid_id].update(shared_params)
-
-            else:
-                # Mixed vegetation type -- produce a list of dicts,
-                # one per non-zero vegetation component. MESHFlow's
-                # render_class_template expects this format.
-                veg_dicts = []
-                for gru_idx in gru_indices:
-                    veg1_p = parse_class_veg1(
-                        veg_section=class_section['veg1'],
-                        gru_idx=gru_idx,
-                    )
-                    veg2_p = parse_class_veg2(
-                        veg_section=class_section['veg2'],
-                        gru_idx=gru_idx,
-                    )
-
-                    if is_water:
-                        class_type = 'water'
-                    else:
-                        class_type = class_name_dict[gru_idx]
-
-                    combined = {'class': class_type}
-                    combined.update(veg1_p)
-                    combined.update(veg2_p)
-                    combined.update(shared_params)
-                    veg_dicts.append(combined)
-
-                gru_entry[hyd2_params['mid_id']] = veg_dicts
-
-        return case_entry, info_entry, gru_entry
-
-    def _analyze_mesh_hydrology(self) -> Dict:
-        """Analyze hydrology and routing components.
-
-        Returns
-        -------
-        tuple
-            ``(routing_dict, hydrology_dict)`` derived from hydrology config.
-        """
-        # extract sections from the hydrology file
-        sections = hydrology_section_divide(
-            os.path.join(self.config['instance_path'], 'MESH_parameters_hydrology.ini')
-        )
-
-        # first, the routing dictionary
-        try:
-            routing_df = pd.read_csv(StringIO(sections[2]), comment='#', sep='\s+', index_col=0, skiprows=1, header=None)
-            routing_df.index = routing_df.index.str.lower()
-
-            # we should return a list of values
-            routing_dict = [v for v in routing_df.to_dict().values()]
-
-        except pd.errors.EmptyDataError:
-            warnings.warn(f"The routing section in MESH_parameters_hydrology.ini"
-                          " is empty. Reading `MESH_parameters.nc` file.")
-            routing_ds = xr.open_dataset(os.path.join(self.config['instance_path'], 'MESH_parameters.nc'))
-            routing_df = routing_ds[['flz', 'pwr']].to_dataframe().T.to_dict()
-
-            routing_dict = [v for v in routing_df.values()]
-
-        # and second, the hydrology dictionary
-        # parse the MID header line (prefixed with '!') to use as column keys
-        hydrology_lines = sections[4].strip().splitlines()
-        mid_columns = None
-        for line in hydrology_lines:
-            if line.strip().startswith('!'):
-                mid_columns = [int(v) for v in line.strip().lstrip('!').split()]
-                break
-
-        hydrology_df = pd.read_csv(StringIO(sections[4]), comment='#', sep='\s+', index_col=0, skiprows=2, header=None)
-        hydrology_df.index = hydrology_df.index.str.lower()
-
-        if mid_columns is not None:
-            hydrology_df.columns = mid_columns
-
-        # and we return a dictionary of this
-        hydrology_dict = hydrology_df.to_dict()
-
-        # if the `MESH_parameters.nc` file exists, we can also
-        # read the hydrology parameters from there
-
-
-        return routing_dict, hydrology_dict
-
     def analyze(self, cache: PathLike = None) -> None:
         """Analyze configuration and populate model parameters and outputs.
 
@@ -750,11 +523,11 @@ class MESH(ModelBuilder):
             for i in range(1, 4):
                 # iterate over the parameter template values
                 for p in constraints_params_template:
-                    # create the parameter name
+                    # create the parameter name: e.g., sand1, clay2, etc.
                     param_name = f"{p.lower()}{i}"
                     # append to the list
                     constraint_params.append(param_name)
-            
+
             # calibration constraints for each class computation unit
             # FIXME: kind of hard-coded assumption that the `class` parameters
             #        are the only ones that need constraints. This should be
@@ -781,6 +554,27 @@ class MESH(ModelBuilder):
                 self._parameter_constraints = {
                     'class': calibration_constraints,
                 }
+
+                # LAMN/LAMX ordered-pair handling:
+                #   * Rename the templated names of every calibrated lamn/lamx
+                #     entry to the ``_<U>LMN[suffix]_`` / ``_<U>LMX[suffix]_``
+                #     convention (trailing underscore, mirroring the CLAY/SAND
+                #     disambiguation trick). For case-4 ``lamx`` the stored name
+                #     is instead overridden to ``_<U>LAMX_EFF[suffix]`` so that
+                #     the model-facing value in ``class.json`` comes from the
+                #     TiedParams block emitted in the Ostrich input.
+                #   * Validate case-2 and case-3 bound-vs-actual relationships
+                #     and raise a clear ``ValueError`` on violation.
+                #   * Record only case-4 entries under the new
+                #     ``'class_lam'`` key so the Jinja template knows which
+                #     (unit, class) pairs need the 4-line TiedParams block.
+                #   Note: case-4 is when both LAMX and LAMN of a computational unit
+                #         are included for the calibration. In this case, the
+                #         calibration mechanism needs to assure the following
+                #         constraint is satisfied: LAMX >= LAMN.
+                class_lam_constraints = self._compute_class_lam_constraints()
+                if class_lam_constraints:
+                    self._parameter_constraints['class_lam'] = class_lam_constraints
 
         return getattr(self, '_parameter_constraints')
     @parameter_constraints.setter
@@ -811,7 +605,7 @@ class MESH(ModelBuilder):
         # given the parameter bounds in self.config['parameter_bounds'],
         # the necessary parameter dictionaries are templated and saved
 
-        # --- normalize list-of-dicts bounds for mixed-veg GRUs ----------
+        # Normalize list-of-dicts bounds for mixed-veg GRUs:
         # Users may supply a list of dicts (each with a 'class' key) for
         # mixed-veg GRUs.  Normalize them into a single dict where veg
         # params map to {class_name: [min, max]} and GRU-level params map
@@ -997,3 +791,400 @@ class MESH(ModelBuilder):
                     f"parameters: {sorted(unit_data.keys())}."
                 )
 
+    def _compute_class_lam_constraints(self) -> Dict:
+        """Classify LAMN/LAMX calibration cases and rename templated names.
+
+        Walks every ``(unit, class?)`` pair in
+        ``self.parameter_bounds['class']`` and classifies the ``lamn`` /
+        ``lamx`` calibration entries into one of four cases:
+
+        * Case 1 — neither ``lamn`` nor ``lamx`` calibrated: no-op.
+        * Case 2 — only ``lamn`` calibrated: validate
+          ``lamn.upper <= actual_lamx`` of that unit/class; on violation
+          raise :class:`ValueError`.
+        * Case 3 — only ``lamx`` calibrated: validate
+          ``lamx.lower >= actual_lamn`` of that unit/class; on violation
+          raise :class:`ValueError`.
+        * Case 4 — both calibrated: record the ``(unit, class?)`` entry
+          in the returned mapping so the OSTRICH TiedParams block is
+          emitted for it.
+
+        For every calibrated ``lamn`` / ``lamx`` entry (cases 2/3/4)
+        this method also rewrites the corresponding string inside
+        ``self.templated_parameters['class']`` in place:
+
+        * ``_<U>LAMN[suffix]`` → ``_<U>LMN[suffix]_``
+        * ``_<U>LAMX[suffix]`` → ``_<U>LMX[suffix]_``
+
+        For case-4 entries, the ``lamx`` string is instead set to
+        ``_<U>LAMX_EFF[suffix]`` so that the model-facing value in
+        ``class.json`` is produced by the 4-line TiedParams block.
+
+        Returns
+        -------
+        dict
+            Mapping ``{unit: {class_name_or_None: True}}`` containing
+            only case-4 entries. Empty dict if no unit/class is in
+            case 4.
+        """
+        class_bounds = self.parameter_bounds.get('class', {}) or {}
+        class_params = self.parameters.get('class', {}) or {}
+        class_templated = self.templated_parameters.get('class', {}) or {}
+
+        class_lam: Dict = {}
+
+        for unit, unit_bounds in class_bounds.items():
+            if not isinstance(unit_bounds, dict):
+                continue
+            unit_data = class_params.get(unit)
+            unit_templated = class_templated.get(unit)
+
+            lamn_raw = unit_bounds.get('lamn')
+            lamx_raw = unit_bounds.get('lamx')
+
+            # Build a list of (class_name_or_None, lamn_bnd, lamx_bnd,
+            #                  actual_lamn, actual_lamx, target_dict)
+            # where ``target_dict`` is the dict in templated_parameters
+            # that holds the ``lamn`` / ``lamx`` keys we may rewrite.
+            entries = []
+
+            if isinstance(unit_data, dict):
+                # Single-veg GRU
+                entries.append((
+                    None, # if cls is provided, it becomes confused with multi-vegetated GRU
+                    lamn_raw if isinstance(lamn_raw, list) else None,
+                    lamx_raw if isinstance(lamx_raw, list) else None,
+                    unit_data.get('lamn'),
+                    unit_data.get('lamx'),
+                    unit_templated if isinstance(unit_templated, dict) else None,
+                ))
+            elif isinstance(unit_data, list):
+                # Mixed-veg GRU: per-class resolution
+                for i, veg_dict in enumerate(unit_data):
+                    cls = veg_dict.get('class')
+                    lamn_bnd = None
+                    lamx_bnd = None
+                    if isinstance(lamn_raw, dict):
+                        lamn_bnd = lamn_raw.get(cls)
+                    if isinstance(lamx_raw, dict):
+                        lamx_bnd = lamx_raw.get(cls)
+                    target = None
+                    if (isinstance(unit_templated, list)
+                            and i < len(unit_templated)
+                            and isinstance(unit_templated[i], dict)):
+                        target = unit_templated[i]
+                    entries.append((
+                        cls,
+                        lamn_bnd,
+                        lamx_bnd,
+                        veg_dict.get('lamn'),
+                        veg_dict.get('lamx'),
+                        target,
+                    ))
+            else:
+                continue
+
+            for cls, lamn_bnd, lamx_bnd, actual_lamn, actual_lamx, target in entries:
+                has_lamn = isinstance(lamn_bnd, (list, tuple)) and len(lamn_bnd) >= 2
+                has_lamx = isinstance(lamx_bnd, (list, tuple)) and len(lamx_bnd) >= 2
+
+                # Case 1: neither calibrated — nothing to do.
+                if not has_lamn and not has_lamx:
+                    continue
+
+                # Case 2: only lamn — validate upper bound vs actual lamx.
+                if has_lamn and not has_lamx:
+                    if isinstance(actual_lamx, (int, float)) and lamn_bnd[1] > actual_lamx:
+                        raise ValueError(
+                            f"Invalid `lamn` calibration range for GRU "
+                            f"{unit!r}"
+                            + (f" (class {cls!r})" if cls is not None else "")
+                            + f": upper bound {lamn_bnd[1]} exceeds the "
+                            f"actual LAMX value {actual_lamx}. Reduce the "
+                            f"`lamn` upper bound so that lamn <= lamx is "
+                            f"guaranteed during sampling."
+                        )
+
+                # Case 3: only lamx — validate lower bound vs actual lamn.
+                if has_lamx and not has_lamn:
+                    if isinstance(actual_lamn, (int, float)) and lamx_bnd[0] < actual_lamn:
+                        raise ValueError(
+                            f"Invalid `lamx` calibration range for GRU "
+                            f"{unit!r}"
+                            + (f" (class {cls!r})" if cls is not None else "")
+                            + f": lower bound {lamx_bnd[0]} is below the "
+                            f"actual LAMN value {actual_lamn}. Raise the "
+                            f"`lamx` lower bound so that lamn <= lamx is "
+                            f"guaranteed during sampling."
+                        )
+
+                # Rename the templated proxy names for any calibrated
+                # lamn/lamx entry (cases 2, 3, 4).
+                if target is not None:
+                    if has_lamn and isinstance(target.get('lamn'), str):
+                        target['lamn'] = _rename_proxy(target['lamn'])
+                    if has_lamx and isinstance(target.get('lamx'), str):
+                        target['lamx'] = _rename_proxy(target['lamx'])
+
+                # Case 4: both calibrated — record + override lamx with EFF.
+                if has_lamn and has_lamx:
+                    # if there is an overlap, then proceed with renaming
+                    # and recording; otherwise, proceed as normal
+                    if lamn_bnd[1] > lamx_bnd[0]:
+                        class_lam.setdefault(unit, {})[cls] = True
+                        if target is not None and isinstance(target.get('lamx'), str):
+                            # target['lamx'] is already the renamed
+                            # ``_<U>LMX[suffix]_``; swap it for the EFF name
+                            # derived from the ORIGINAL param_name_gen form.
+                            # Reconstruct the suffix from the renamed string
+                            # by stripping the leading ``_<unit>LMX`` and the
+                            # trailing ``_``: what's left is the suffix
+                            # (possibly empty for single-veg).
+                            renamed = target['lamx']
+                            prefix = '_' + str(unit) + 'LMX'
+                            assert renamed.startswith(prefix) and renamed.endswith('_')
+                            suffix = renamed[len(prefix):-1]
+                            target['lamx'] = '_' + str(unit) + 'LAMX_EFF' + suffix
+
+        return class_lam
+
+    def _copy_minimum_files(self, dest_path: str) -> None:
+        """Copy the minimum required files to a destination path.
+
+        Parameters
+        ----------
+        dest_path : str
+            Destination directory where required files are copied.
+
+        Raises
+        ------
+        FileNotFoundError
+            If any required file is missing in the source instance path.
+        """
+        for file in self.required_files:
+            src_file = os.path.join(self.config['instance_path'], file)
+            dest_file = os.path.join(dest_path, file)
+            if os.path.isfile(src_file):
+                shutil.copy2(src_file, dest_file)
+            else:
+                raise FileNotFoundError(
+                    f"The required file {file} is not found in the instance path "
+                    f"{self.config['instance_path']}."
+                )
+        return
+
+    def _analyze_mesh_class(self) -> Dict:
+        """Analyze CLASS file and construct parameter structures.
+
+        Parses ``MESH_parameters_CLASS.ini`` into multiple sections and builds
+        structures required for templating.
+
+        Notes
+        -----
+        Future releases may also use ``MESH_parameters.txt`` and
+        ``MESH_parameters.nc``.
+
+        Returns
+        -------
+        tuple
+            ``(case_entry, info_entry, gru_entry)`` where entries are dicts
+            keyed per MESH/CLASS semantics.
+        """
+        # two necessary paths for the analysis
+        class_file = os.path.join(
+            self.config['instance_path'], 'MESH_parameters_CLASS.ini'
+        )
+
+        # read the MESH/CLASS file
+        text = Path(class_file).read_text(encoding="utf-8")
+
+        # Split where there is at least one completely blank
+        # line (possibly with spaces)
+        sections = re.split(r'\r?\n\s*\r?\n', text.strip())
+
+        # first section is typically the information section
+        # the middle sections are CLASS computational unit blocks, each
+        #     containing vegetation, soil, hydrology, and prognostic parameters
+        # the last section are the dates that should not be processed and 
+        #     its content does not matter for the analysis
+
+        # building dictionaries out of the first section needed for 
+        # MESHFLOW's `meshflow.utility.render_class_template` function
+        info_entry, case_entry = \
+            parse_class_meta_data(sections[0])
+
+        # create an empty gru_entry dictionary to be further
+        # populated by the following iterative loop
+        gru_entry = {}
+
+        # iterating over the sections until the last one
+        for idx, section in enumerate(sections[1:-1], start=1):
+            # divide the section into a dictionary of sections
+            class_section = class_section_divide(section=section)
+
+            # determine GRU type, based on CLASS assumptions:
+            #    1. needleleaf forest
+            #    2. broadleaf forest
+            #    3. cropland
+            #    4. grassland
+            #    5. urban, barren land, or imprevious area
+            gru_indices = determine_gru_type(
+                line=class_section['veg1'].splitlines()[0],
+                fallback_line=class_section['veg1'].splitlines()[1],
+            )
+            # based on the number extracted above, we can name the
+            # GRU class
+            class_name_dict = {
+                1: "needleleaf",
+                2: "broadleaf",
+                3: "crop",
+                4: "grassland",
+                5: "urban",
+            }
+
+            # parse shared (non-veg) sections -- these are the same
+            # regardless of vegetation type
+            hyd1_params = parse_class_hyd1(
+                hyd_line=class_section['hyd1'],
+            )
+            hyd2_params = parse_class_hyd2(
+                hyd_line=class_section['hyd2'],
+            )
+            soil_params = parse_class_soil(
+                soil_section=class_section['soil'],
+            )
+            prog1_params = parse_class_prog1(
+                prog_line=class_section['prog1'],
+            )
+            prog2_params = parse_class_prog2(
+                prog_line=class_section['prog2'],
+            )
+            prog3_params = parse_class_prog3(
+                prog_line=class_section['prog3'],
+            )
+
+            # shared (non-veg) params collected for reuse
+            shared_params = {}
+            for d in [hyd1_params, hyd2_params, soil_params,
+                      prog1_params, prog2_params, prog3_params]:
+                shared_params.update(d)
+            # ``mid_id`` is a GRU identifier (used as the outer key of
+            # ``gru_entry`` below), not a CLASS parameter. Drop it from
+            # ``shared_params`` so it is not emitted inside each GRU's
+            # inner dict in ``class.json`` (meshflow's
+            # ``_extract_class_params`` rejects keys absent from
+            # ``default_CLASS_lines.json``).
+            shared_params.pop('mid_id', None)
+
+            # determine water-like override from the MID descriptor
+            is_water = any(
+                kw in hyd2_params['mid'].lower()
+                for kw in ('water', 'snow', 'ice')
+            )
+
+            if len(gru_indices) == 1:
+                # Single vegetation type -- existing behavior
+                gru_idx = gru_indices[0]
+
+                veg1_params = parse_class_veg1(
+                    veg_section=class_section['veg1'],
+                    gru_idx=gru_idx,
+                )
+                veg2_params = parse_class_veg2(
+                    veg_section=class_section['veg2'],
+                    gru_idx=gru_idx,
+                )
+
+                if is_water:
+                    class_type = 'water'
+                else:
+                    class_type = class_name_dict[gru_idx]
+
+                mid_id = hyd2_params['mid_id']
+                gru_entry[mid_id] = {'class': class_type}
+                gru_entry[mid_id].update(veg1_params)
+                gru_entry[mid_id].update(veg2_params)
+                gru_entry[mid_id].update(shared_params)
+
+            else:
+                # Mixed vegetation type -- produce a list of dicts,
+                # one per non-zero vegetation component. MESHFlow's
+                # render_class_template expects this format.
+                veg_dicts = []
+                for gru_idx in gru_indices:
+                    veg1_p = parse_class_veg1(
+                        veg_section=class_section['veg1'],
+                        gru_idx=gru_idx,
+                    )
+                    veg2_p = parse_class_veg2(
+                        veg_section=class_section['veg2'],
+                        gru_idx=gru_idx,
+                    )
+
+                    if is_water:
+                        class_type = 'water'
+                    else:
+                        class_type = class_name_dict[gru_idx]
+
+                    combined = {'class': class_type}
+                    combined.update(veg1_p)
+                    combined.update(veg2_p)
+                    combined.update(shared_params)
+                    veg_dicts.append(combined)
+
+                gru_entry[hyd2_params['mid_id']] = veg_dicts
+
+        return case_entry, info_entry, gru_entry
+
+    def _analyze_mesh_hydrology(self) -> Dict:
+        """Analyze hydrology and routing components.
+
+        Returns
+        -------
+        tuple
+            ``(routing_dict, hydrology_dict)`` derived from hydrology config.
+        """
+        # extract sections from the hydrology file
+        sections = hydrology_section_divide(
+            os.path.join(self.config['instance_path'], 'MESH_parameters_hydrology.ini')
+        )
+
+        # first, the routing dictionary
+        try:
+            routing_df = pd.read_csv(StringIO(sections[2]), comment='#', sep='\s+', index_col=0, skiprows=1, header=None)
+            routing_df.index = routing_df.index.str.lower()
+
+            # we should return a list of values
+            routing_dict = [v for v in routing_df.to_dict().values()]
+
+        except pd.errors.EmptyDataError:
+            warnings.warn(f"The routing section in MESH_parameters_hydrology.ini"
+                          " is empty. Reading `MESH_parameters.nc` file.")
+            routing_ds = xr.open_dataset(os.path.join(self.config['instance_path'], 'MESH_parameters.nc'))
+            routing_df = routing_ds[['flz', 'pwr']].to_dataframe().T.to_dict()
+
+            routing_dict = [v for v in routing_df.values()]
+
+        # and second, the hydrology dictionary
+        # parse the MID header line (prefixed with '!') to use as column keys
+        hydrology_lines = sections[4].strip().splitlines()
+        mid_columns = None
+        for line in hydrology_lines:
+            if line.strip().startswith('!'):
+                mid_columns = [int(v) for v in line.strip().lstrip('!').split()]
+                break
+
+        hydrology_df = pd.read_csv(StringIO(sections[4]), comment='#', sep='\s+', index_col=0, skiprows=2, header=None)
+        hydrology_df.index = hydrology_df.index.str.lower()
+
+        if mid_columns is not None:
+            hydrology_df.columns = mid_columns
+
+        # and we return a dictionary of this
+        hydrology_dict = hydrology_df.to_dict()
+
+        # if the `MESH_parameters.nc` file exists, we can also
+        # read the hydrology parameters from there
+
+
+        return routing_dict, hydrology_dict
