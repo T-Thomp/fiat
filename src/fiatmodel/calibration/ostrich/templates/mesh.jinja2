@@ -62,7 +62,8 @@ ModelSubdir         cpu_
 ObjectiveFunction   GCOP
 
 # Useful optional variables
-PreserveModelOutput    ./etc/scripts/archive.sh
+PreserveBestModel      ./etc/scripts/archive.sh
+PreserveModelOutput    no
 OstrichWarmStart       yes
 NumDigitsOfPrecision   8
 TelescopingStrategy    none

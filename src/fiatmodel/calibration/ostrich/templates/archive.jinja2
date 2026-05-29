@@ -1,8 +1,7 @@
 #!/bin/bash
 # Archive script for OSTRICH calibration best-run preservation.
-# Called by OSTRICH via PreserveModelOutput with:
-#   $1 = rank, $2 = trial, $3 = counter, $4 = objective_category
-# Only the "best" run is fully archived; all others are ignored.
+# Called by OSTRICH via PreserveBestModel each time a new best
+# parameter set is discovered. No arguments are passed.
 
 set -euo pipefail
 
@@ -14,25 +13,18 @@ calibration_root="{{ calibration_root }}"
 model="{{ model }}"
 
 # ---------------------------------------------------------------------------
-# Inputs from OSTRICH
+# Infer rank from working directory name (cpu_0, cpu_1, ...)
 # ---------------------------------------------------------------------------
-rank="${1:-}"
-trial="${2:-}"
-counter="${3:-}"
-objective_category="${4:-}"
-
-# ---------------------------------------------------------------------------
-# Early exit for non-best runs
-# ---------------------------------------------------------------------------
-if [[ "${objective_category}" != "best" ]]; then
-    exit 0
-fi
+rank=$(basename "$(pwd)" | grep -o '[0-9]*$')
 
 # ---------------------------------------------------------------------------
 # Archive path (co-located with calibration root)
 # ---------------------------------------------------------------------------
 archive_path="${calibration_root}/logs/archive_${model}_${time_stamp}"
 best_path="${archive_path}/run_best"
+
+# Remove previous best to avoid stale files from earlier runs
+rm -rf "${best_path}"
 mkdir -p "${best_path}"
 
 # ---------------------------------------------------------------------------
@@ -69,8 +61,8 @@ mkdir -p "${best_path}/ostrich_metadata"
 
 for prefix in OstModel OstOutput OstErrors; do
     src=""
-    if [[ -f "${calibration_root}/${prefix}0.txt" ]]; then
-        src="${calibration_root}/${prefix}0.txt"
+    if [[ -f "${calibration_root}/${prefix}${rank}.txt" ]]; then
+        src="${calibration_root}/${prefix}${rank}.txt"
     elif [[ -f "./${prefix}${rank}.txt" ]]; then
         src="./${prefix}${rank}.txt"
     fi
@@ -131,9 +123,6 @@ fi
 cat > "${best_path}/run_info.json" <<EOF
 {
     "rank": "${rank}",
-    "trial": "${trial}",
-    "counter": "${counter}",
-    "objective_category": "${objective_category}",
     "timestamp": "${time_stamp}",
     "calibration_root": "${calibration_root}",
     "archive_path": "${archive_path}",
