@@ -36,7 +36,7 @@ none {{ scale }} none
 {% set current_time = info.get('current_time') %}
 {% set parameters = info.get('parameters') %}
 {% set calibration_bounds = info.get('parameter_bounds') %}
-{% set constraints = info.get('parameter_constraints') %}
+{% set param_constraints = info.get('parameter_constraints') %}
 {#
    ==================
    Main OSTRICH Block
@@ -381,18 +381,18 @@ EndParams
 {#
   Precompute whether ``BeginTiedParams`` will have any content so that the
   block is suppressed when empty. Two producers populate it today:
-    1. ``constraints.class`` entries whose match list is non-empty
+    1. ``param_constraints.class`` entries whose match list is non-empty
        (the soil CLAY/SAND TiedParams loop below).
-    2. ``constraints.class_lam`` non-empty (the LAMN/LAMX ordered-pair
+    2. ``param_constraints.class_lam`` non-empty (the LAMN/LAMX ordered-pair
        block further down).
   When adding a new producer, extend ``tied.has`` accordingly or the new
   output will be silently suppressed.
 #}
 {% set tied = namespace(has=false) %}
-{% if constraints is defined and constraints is mapping %}
-  {% set _cl = constraints.get('class_lam') %}
+{% if param_constraints is defined and param_constraints is mapping %}
+  {% set _cl = param_constraints.get('class_lam') %}
   {% if _cl is mapping and _cl %}{% set tied.has = true %}{% endif %}
-  {% set _cm = constraints.get('class') %}
+  {% set _cm = param_constraints.get('class') %}
   {% if _cm is mapping %}
     {% for _u, _m in _cm.items() %}
       {% if _m %}{% set tied.has = true %}{% endif %}
@@ -419,7 +419,7 @@ BeginTiedParams
     - The constraints are defined for each layer separately, and cannot
       include parameters from different layers.
 #}
-  {% for constraint_group, constraint_dict in constraints.items() %}
+  {% for constraint_group, constraint_dict in param_constraints.items() %}
     {# Defining constraint parameters explicitely for MESH soil layers #}
     {% set constraint_params = ['clay1', 'clay2', 'clay3', 'sand1', 'sand2', 'sand3'] %}
     {# Before iterating over the soil layers, it is important to keep
@@ -446,10 +446,10 @@ BeginTiedParams
                   {% set clay_val = unit_data_c.get('clay' ~ layer_num) %}
                   {% set sand_val = unit_data_c.get('sand' ~ layer_num) %}
                 {% elif unit_data_c is iterable %}
-                  {# Mixed-veg GRU: soil params are GRU-level, templated in the first veg_dict #}
+                  {# Mixed-veg GRU: soil params are GRU-level, templated in the last veg_dict #}
                   {% set ns_clay = namespace(val=none) %}
                   {% set ns_sand = namespace(val=none) %}
-                  {% for veg_dict in unit_data_c %}
+                  {% for veg_dict in unit_data_c | reverse %}
                     {% if ns_clay.val is none and veg_dict.get('clay' ~ layer_num) is defined %}
                       {% set ns_clay.val = veg_dict.get('clay' ~ layer_num) %}
                     {% endif %}
@@ -526,7 +526,7 @@ BeginTiedParams
    positive-part construction below matches the mathematical identity
    ``max(a, b) = b + max(0, a - b) = b + (|a - b| + (a - b)) / 2``.
 #}
-{% set class_lam = constraints.get('class_lam') if constraints is mapping else none %}
+{% set class_lam = param_constraints.get('class_lam') if param_constraints is mapping else none %}
 {% if class_lam is mapping %}
   {% for unit, class_map in class_lam.items() %}
     {% if class_map is mapping %}
