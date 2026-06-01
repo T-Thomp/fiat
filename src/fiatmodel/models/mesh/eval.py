@@ -542,6 +542,17 @@ if __name__ == "__main__":
                     if name in metrics:
                         metrics[func] = metrics.pop(name)
 
+    # Replace string keys with the reconstructed callables in constraints.
+    if _user_metric_funcs:
+        constraints = eval_config.get('constraints')
+        if constraints:
+            for group in constraints:
+                for flux_var in constraints[group]:
+                    metrics = constraints[group][flux_var]
+                    for name, func in _user_metric_funcs.items():
+                        if name in metrics:
+                            metrics[func] = metrics.pop(name)
+
     # empty the output directory before anything else
     _reset_dir(
         os.path.join(
