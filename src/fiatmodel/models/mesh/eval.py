@@ -371,6 +371,12 @@ def resample_per_variable(
     :class:`xarray.Dataset`
         A dataset containing the resampled variables.
 
+    Notes
+    -----
+    Data variables that do not carry the resampling dimension (e.g. the
+    scalar ``crs`` variable written by MESH) cannot be resampled and are
+    passed through unchanged.
+
     Raises
     ------
     ValueError
@@ -394,6 +400,10 @@ def resample_per_variable(
 
     out = {}
     for var in ds.data_vars:
+        if dim not in ds[var].dims:
+            # static (non-time) variable: cannot be resampled, keep as-is
+            out[var] = ds[var]
+            continue
         reducer = methods.get(var, default)
         if reducer is None:
             continue
@@ -688,6 +698,11 @@ if __name__ == "__main__":
         sim_ts = xr.infer_freq(sim_sub['time'])
         ts_interval = pd.tseries.frequencies.to_offset
         if ts_interval(obs_ts) != ts_interval(sim_ts):
+            # only time-dependent variables can be resampled; static
+            # variables (e.g. the scalar `crs` written by MESH) are
+            # ignored here and kept as-is by `resample_per_variable`
+            time_vars = [v for v in sim_sub.data_vars
+                         if 'time' in sim_sub[v].dims]
             # build per-variable resampling methods from `defaults.json`;
             # aggregation keys (e.g., "mean", "sum") must match xarray
             # resampler method names
@@ -695,10 +710,10 @@ if __name__ == "__main__":
                 var: how
                 for how, variables in DEFAULTS.get('output_variables', {}).items()
                 for var in variables
-                if var in sim_sub.data_vars
+                if var in time_vars
             }
             # variables not listed in `defaults.json` fall back to `mean`
-            unlisted_vars = sorted(set(sim_sub.data_vars) - set(resample_methods))
+            unlisted_vars = sorted(set(time_vars) - set(resample_methods))
             if unlisted_vars:
                 warnings.warn(
                     f"Variable(s) {unlisted_vars} not listed under "
