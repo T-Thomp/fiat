@@ -20,8 +20,9 @@ for MESH-based workflows. It performs the following high-level steps:
 Notes
 -----
 - The script is designed to be dynamically generated and invoked by FIAT.
-- Resampling behavior currently simplifies to mean/sum per variable as a
-    placeholder for streamflow-only usage. Future releases may generalize this.
+- Resampling aggregation (e.g., mean vs. sum) is controlled per variable
+    via the ``output_variables`` section of :file:`defaults.json`. Variables
+    not listed there are resampled with ``mean`` and a warning is issued.
 - Time frequency inference uses :class:`pandas.DatetimeIndex` information and
     falls back to selecting the mode of observed time deltas when needed.
 
@@ -686,14 +687,31 @@ if __name__ == "__main__":
         obs_ts = str(np.unique(obs_sub['freq'].values)[0])
         sim_ts = xr.infer_freq(sim_sub['time'])
         ts_interval = pd.tseries.frequencies.to_offset
-        # FIXME: for now, the variables are averaged. As, the script is set to
-        #        work with streamflow only (simplifying assumption). This will
-        #        be fixed in the future releases.
         if ts_interval(obs_ts) != ts_interval(sim_ts):
-            resample_vars = set(sim_sub.variables) - set(DEFAULTS.get('default_variables'))
-            for v in resample_vars:
-                how = 'mean' if v in DEFAULTS['output_variables']['mean'] else 'sum'
-                sim_sub = resample_per_variable(sim_sub, rule=obs_ts, methods={"QO": "sum", "QI": "mean"})
+            # build per-variable resampling methods from `defaults.json`;
+            # aggregation keys (e.g., "mean", "sum") must match xarray
+            # resampler method names
+            resample_methods = {
+                var: how
+                for how, variables in DEFAULTS.get('output_variables', {}).items()
+                for var in variables
+                if var in sim_sub.data_vars
+            }
+            # variables not listed in `defaults.json` fall back to `mean`
+            unlisted_vars = sorted(set(sim_sub.data_vars) - set(resample_methods))
+            if unlisted_vars:
+                warnings.warn(
+                    f"Variable(s) {unlisted_vars} not listed under "
+                    "'output_variables' in defaults.json — resampling with "
+                    "'mean'. Add them to defaults.json to control their "
+                    "aggregation."
+                )
+            sim_sub = resample_per_variable(
+                sim_sub,
+                rule=obs_ts,
+                methods=resample_methods,
+                default='mean',
+            )
 
         # Filter out stations whose observations are entirely NaN for
         # the selected calibration period.  Keeps only stations that have
