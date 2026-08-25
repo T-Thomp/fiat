@@ -443,6 +443,18 @@ class Calibration(object):
                 idx = pd.to_datetime(list(t))
                 vals = np.array(list(v), dtype=float)
 
+            entry_label = f" for entry '{e.get('name')}'" if e.get('name') else ''
+            if not idx.is_unique:
+                n_dup = idx.size - idx.nunique()
+                duplicates = idx[idx.duplicated(keep='first')]
+                raise ValueError(
+                    f"Duplicate timestamps in observation time series{entry_label}: "
+                    f"{n_dup} of {idx.size} timestamps occur more than once "
+                    f"(e.g. {duplicates[:3].tolist()}). Merge overlapping data "
+                    "sources before passing to FIAT, or deduplicate the index "
+                    "(e.g. series[~series.index.duplicated(keep='first')])."
+                )
+
             per_entry_series.append(pd.Series(vals, index=idx))
             per_entry_time_index.append(idx)
 

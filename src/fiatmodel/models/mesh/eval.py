@@ -262,14 +262,26 @@ def validate_dataset_dims(ds: xr.Dataset, label: str) -> None:
     Raises
     ------
     ValueError
-        If the ``subbasin`` or ``time`` dimensions are missing, or ``time``
-        is not an index coordinate.
+        If the ``subbasin`` or ``time`` dimensions are missing, ``time``
+        is not an index coordinate, or the ``time`` index contains
+        duplicate timestamps.
     """
     for dim in ['subbasin', 'time']:
         if dim not in ds.dims:
             raise ValueError(f"Dimension `{dim}` not found in {label}.")
     if 'time' not in ds.indexes:
         raise ValueError(f"`time` is not an index coordinate in {label}.")
+
+    time_index = ds.indexes['time']
+    if not time_index.is_unique:
+        n_dup = time_index.size - time_index.nunique()
+        duplicates = time_index[time_index.duplicated(keep='first')]
+        raise ValueError(
+            f"`time` index in {label} has {n_dup} duplicate timestamp(s) of "
+            f"{time_index.size} (e.g. {duplicates[:3].tolist()}). Ensure each "
+            "timestamp appears only once (e.g. "
+            "series[~series.index.duplicated(keep='first')])."
+        )
 
 def build_calibration_subset(
     ds: xr.Dataset, 
