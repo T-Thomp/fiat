@@ -555,7 +555,7 @@ class Calibration(object):
 
         coords = {
             dim_name: cu_ids,
-            "time": global_time,
+            "time": ("time", global_time),
             "name": (dim_name, name_arr),
             "freq": (dim_name, freq_arr),
         }

@@ -249,6 +249,28 @@ def infer_frequency(time_index: pd.DatetimeIndex) -> DateOffset:
     step = deltas.mode().iloc[0]
     return pd.tseries.frequencies.to_offset(step)
 
+def validate_dataset_dims(ds: xr.Dataset, label: str) -> None:
+    """Sanity-check required dimensions and the ``time`` index of a dataset.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset to validate.
+    label : str
+        Human-readable description of the dataset used in error messages.
+
+    Raises
+    ------
+    ValueError
+        If the ``subbasin`` or ``time`` dimensions are missing, or ``time``
+        is not an index coordinate.
+    """
+    for dim in ['subbasin', 'time']:
+        if dim not in ds.dims:
+            raise ValueError(f"Dimension `{dim}` not found in {label}.")
+    if 'time' not in ds.indexes:
+        raise ValueError(f"`time` is not an index coordinate in {label}.")
+
 def build_calibration_subset(
     ds: xr.Dataset, 
     dates: Sequence[Mapping[str, Any]],
@@ -575,6 +597,17 @@ if __name__ == "__main__":
     # read the observation file
     observations = xr.open_dataset(eval_config['observations_file'])
 
+    # sanity check the observation data before running the model
+    try:
+        validate_dataset_dims(observations, 'observation data')
+    except ValueError as e:
+        warnings.warn(
+            f'OBSERVATION DATA CORRUPTED: {str(e)}. '
+            'OBJECTIVE FUNCTION VALUES WILL BE SET TO A LARGE NUMBER.'
+        )
+        write_penalty_values(eval_config)
+        sys.exit(0)
+
     # files to be read
     root_file_path = os.path.join('./etc', 'eval')
     # `parameters` JSON files are needed to render templates
@@ -673,16 +706,10 @@ if __name__ == "__main__":
             )
         )
 
-        # sanity check: both datasets need 'subbasin' and 'time' dimensions
-        for dim in ['subbasin', 'time']:
-            if dim not in simulations.dims:
-                raise ValueError(
-                    f'Dimension `{dim}` not found in simulation results.'
-                )
-            if dim not in observations.dims:
-                raise ValueError(
-                    f'Dimension `{dim}` not found in observation data.'
-                )
+        # sanity check: both datasets need 'subbasin' and 'time' dims,
+        # and 'time' must be an index coordinate
+        validate_dataset_dims(simulations, 'simulation results')
+        validate_dataset_dims(observations, 'observation data')
 
         # subset to calibration dates
         allow_mismatch = eval_config.get('allow_date_mismatch', False)
