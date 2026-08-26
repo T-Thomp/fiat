@@ -444,6 +444,14 @@ class Calibration(object):
                 vals = np.array(list(v), dtype=float)
 
             entry_label = f" for entry '{e.get('name')}'" if e.get('name') else ''
+            if idx.isna().any():
+                n_na = int(idx.isna().sum())
+                raise ValueError(
+                    f"NaT timestamps in observation time series{entry_label}: "
+                    f"{n_na} of {idx.size} timestamps are NaT. "
+                    "Missing or unparseable dates must be removed before "
+                    "passing to FIAT (e.g. dropna() on the index)."
+                )
             if not idx.is_unique:
                 n_dup = idx.size - idx.nunique()
                 duplicates = idx[idx.duplicated(keep='first')]
