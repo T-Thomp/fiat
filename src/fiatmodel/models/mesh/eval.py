@@ -12,7 +12,9 @@ for MESH-based workflows. It performs the following high-level steps:
     files in ``./etc/eval`` and writes them into the model instance directory.
 - Executes the MESH model executable and collects simulation results.
 - Aligns observations and simulations across one or more calibration date
-    intervals, inferring/resampling time frequency when needed.
+    intervals: the requested period is extracted from the simulation at its
+    native time grid, aggregated to the observation time resolution, and the
+    observations are then aligned onto the same time axis.
 - Computes metrics using :mod:`HydroErr` and combines them into objective
     functions via :mod:`numexpr`, writing single-valued CSV results for each
     configured objective function.
@@ -50,6 +52,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Tuple,
     Union
 )
 
@@ -377,6 +380,7 @@ def resample_per_variable(
     dim: str = "time",
     methods: Optional[Dict[str, Union[str, Callable]]] = None,
     default: Optional[Union[str, Callable]] = None,
+    origin: Optional[Any] = None,
     **kwargs: Any
 ) -> xr.Dataset:
     """Resample variables using per-variable reducers.
@@ -396,6 +400,11 @@ def resample_per_variable(
     default : str or callable, optional
         Fallback reducer applied to variables not present in ``methods``.
         If ``None``, variables without an explicit reducer are skipped.
+    origin : str or :class:`pandas.Timestamp`, optional
+        Timestamp (or xarray origin keyword) anchoring the resampling bins.
+        Pass the first timestamp of the observation time index so the
+        aggregated labels land exactly on the observation timestamps.
+        ``None`` keeps xarray's default (``'start_day'``).
     **kwargs
         Additional keyword arguments passed to the reducer (for example,
         ``skipna=True``, ``keep_attrs=True``).
@@ -441,7 +450,10 @@ def resample_per_variable(
         reducer = methods.get(var, default)
         if reducer is None:
             continue
-        resampler = ds[var].resample({dim: rule})
+        resampler_kwargs = {}
+        if origin is not None:
+            resampler_kwargs['origin'] = origin
+        resampler = ds[var].resample({dim: rule}, **resampler_kwargs)
         if isinstance(reducer, str):
             if not hasattr(resampler, reducer):
                 raise ValueError(f"Reducer '{reducer}' not available for '{var}'")
@@ -451,6 +463,101 @@ def resample_per_variable(
         else:
             raise TypeError(f"Reducer for '{var}' must be a string or callable")
     return xr.Dataset(out)
+
+def align_calibration_subset(
+    simulations: xr.Dataset,
+    observations: xr.Dataset,
+    dates: Sequence[Mapping[str, Any]],
+    allow_date_mismatch: bool = False,
+) -> Tuple[xr.Dataset, xr.Dataset]:
+    """Extract the calibration window and align both datasets on one time axis.
+
+    The requested ``dates`` are applied exactly to the simulation's native
+    time grid (see :func:`build_calibration_subset`), which requires the
+    simulation to carry those timestamps.  The simulation is then aggregated
+    to the observations' time resolution, with the aggregation anchored to
+    the observations' own time grid (phase) so the aggregated labels
+    coincide with the observation timestamps.  Finally, the observations are
+    reindexed onto that aggregated grid, which is an exact alignment when
+    the observation series is sampled on the same regular grid.
+
+    Both returned datasets therefore share one identical ``time`` axis and
+    can enter element-wise objective-function computations directly.
+
+    Parameters
+    ----------
+    simulations : :class:`xarray.Dataset`
+        Simulation results containing ``subbasin`` and ``time`` dimensions.
+    observations : :class:`xarray.Dataset`
+        Observation dataset with ``subbasin`` and ``time`` dimensions, a
+        per-station ``freq`` variable and a regular time index.
+    dates : sequence of mapping
+        Iterable of ``{"start": <str>, "end": <str>}`` dictionaries defining
+        the closed calibration intervals (see :func:`build_calibration_subset`).
+    allow_date_mismatch : bool, default False
+        If ``True``, allow the requested calibration range to extend beyond
+        the simulation's time span (missing simulation steps are filled with
+        NaN); otherwise a ``KeyError`` is raised.
+
+    Returns
+    -------
+    tuple of :class:`xarray.Dataset`
+        ``(sim_sub, obs_sub)`` — the simulation aggregated to the
+        observation time resolution and the observations aligned onto the
+        same time axis.
+    """
+    # (1) extract the requested period from the simulation at its native
+    # time grid; bounds-check against the simulation time span
+    sim_sub = build_calibration_subset(
+        simulations, dates, allow_date_mismatch=allow_date_mismatch
+    )
+
+    # (2) aggregate the simulation to the observations' time resolution if
+    # the time-steps differ, anchoring the bins to the observations' own
+    # time grid so the aggregated labels land exactly on the observation
+    # timestamps
+    obs_ts = str(np.unique(observations['freq'].values)[0])
+    sim_ts = xr.infer_freq(sim_sub['time'])
+    ts_interval = pd.tseries.frequencies.to_offset
+    if ts_interval(obs_ts) != ts_interval(sim_ts):
+        # only time-dependent variables can be resampled; static
+        # variables (e.g. the scalar `crs` written by MESH) are
+        # ignored here and kept as-is by `resample_per_variable`
+        time_vars = [v for v in sim_sub.data_vars
+                     if 'time' in sim_sub[v].dims]
+        # build per-variable resampling methods from `defaults.json`;
+        # aggregation keys (e.g., "mean", "sum") must match xarray
+        # resampler method names
+        resample_methods = {
+            var: how
+            for how, variables in DEFAULTS.get('output_variables', {}).items()
+            for var in variables
+            if var in time_vars
+        }
+        # variables not listed in `defaults.json` fall back to `mean`
+        unlisted_vars = sorted(set(time_vars) - set(resample_methods))
+        if unlisted_vars:
+            warnings.warn(
+                f"Variable(s) {unlisted_vars} not listed under "
+                "'output_variables' in defaults.json — resampling with "
+                "'mean'. Add them to defaults.json to control their "
+                "aggregation."
+            )
+        sim_sub = resample_per_variable(
+            sim_sub,
+            rule=obs_ts,
+            methods=resample_methods,
+            default='mean',
+            origin=observations.indexes['time'][0],
+        )
+
+    # (3) align the observations onto the (aggregated) simulation grid.
+    # Because the aggregation above is anchored to the observations' own
+    # time grid, this reindex is exact and introduces no NaNs; genuinely
+    # missing observation days remain NaN and are handled downstream
+    # (station filter, HydroErr skipna).
+    obs_sub = observations.reindex(time=sim_sub['time'])
+    return sim_sub, obs_sub
 
 def build_station_series(sim_sub, obs_sub, flux_var, station_ids):
     """Build per-station simulation and observation series for a given flux.
@@ -723,49 +830,17 @@ if __name__ == "__main__":
         validate_dataset_dims(simulations, 'simulation results')
         validate_dataset_dims(observations, 'observation data')
 
-        # subset to calibration dates
+        # subset to calibration dates: extract the requested period from
+        # the simulation at its native time grid, aggregate it to the
+        # observations' time resolution, and align the observations onto
+        # the same time axis
         allow_mismatch = eval_config.get('allow_date_mismatch', False)
-        sim_sub = build_calibration_subset(
-            simulations, eval_config.get('dates'), allow_date_mismatch=allow_mismatch
+        sim_sub, obs_sub = align_calibration_subset(
+            simulations,
+            observations,
+            eval_config.get('dates'),
+            allow_date_mismatch=allow_mismatch,
         )
-        obs_sub = build_calibration_subset(
-            observations, eval_config.get('dates'), allow_date_mismatch=allow_mismatch
-        )
-
-        # resample if observation and simulation time-steps differ
-        obs_ts = str(np.unique(obs_sub['freq'].values)[0])
-        sim_ts = xr.infer_freq(sim_sub['time'])
-        ts_interval = pd.tseries.frequencies.to_offset
-        if ts_interval(obs_ts) != ts_interval(sim_ts):
-            # only time-dependent variables can be resampled; static
-            # variables (e.g. the scalar `crs` written by MESH) are
-            # ignored here and kept as-is by `resample_per_variable`
-            time_vars = [v for v in sim_sub.data_vars
-                         if 'time' in sim_sub[v].dims]
-            # build per-variable resampling methods from `defaults.json`;
-            # aggregation keys (e.g., "mean", "sum") must match xarray
-            # resampler method names
-            resample_methods = {
-                var: how
-                for how, variables in DEFAULTS.get('output_variables', {}).items()
-                for var in variables
-                if var in time_vars
-            }
-            # variables not listed in `defaults.json` fall back to `mean`
-            unlisted_vars = sorted(set(time_vars) - set(resample_methods))
-            if unlisted_vars:
-                warnings.warn(
-                    f"Variable(s) {unlisted_vars} not listed under "
-                    "'output_variables' in defaults.json — resampling with "
-                    "'mean'. Add them to defaults.json to control their "
-                    "aggregation."
-                )
-            sim_sub = resample_per_variable(
-                sim_sub,
-                rule=obs_ts,
-                methods=resample_methods,
-                default='mean',
-            )
 
         # Filter out stations whose observations are entirely NaN for
         # the selected calibration period.  Keeps only stations that have
@@ -902,6 +977,7 @@ if __name__ == "__main__":
                                 f"'{flux_var}'."
                             )
 
+                        expressions = normalize_expressions(metrics[metric_name])
                         for idx, expr in enumerate(expressions, start=1):
                             try:
                                 metric_value = ne.evaluate(expr, local_dict=station_metrics)
