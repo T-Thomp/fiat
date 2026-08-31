@@ -443,6 +443,26 @@ class Calibration(object):
                 idx = pd.to_datetime(list(t))
                 vals = np.array(list(v), dtype=float)
 
+            entry_label = f" for entry '{e.get('name')}'" if e.get('name') else ''
+            if idx.isna().any():
+                n_na = int(idx.isna().sum())
+                raise ValueError(
+                    f"NaT timestamps in observation time series{entry_label}: "
+                    f"{n_na} of {idx.size} timestamps are NaT. "
+                    "Missing or unparseable dates must be removed before "
+                    "passing to FIAT (e.g. dropna() on the index)."
+                )
+            if not idx.is_unique:
+                n_dup = idx.size - idx.nunique()
+                duplicates = idx[idx.duplicated(keep='first')]
+                raise ValueError(
+                    f"Duplicate timestamps in observation time series{entry_label}: "
+                    f"{n_dup} of {idx.size} timestamps occur more than once "
+                    f"(e.g. {duplicates[:3].tolist()}). Merge overlapping data "
+                    "sources before passing to FIAT, or deduplicate the index "
+                    "(e.g. series[~series.index.duplicated(keep='first')])."
+                )
+
             per_entry_series.append(pd.Series(vals, index=idx))
             per_entry_time_index.append(idx)
 
@@ -555,7 +575,7 @@ class Calibration(object):
 
         coords = {
             dim_name: cu_ids,
-            "time": global_time,
+            "time": ("time", global_time),
             "name": (dim_name, name_arr),
             "freq": (dim_name, freq_arr),
         }
